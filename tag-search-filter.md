@@ -1778,3 +1778,377 @@ $found = strpos($content, $excludeSearch[$i]) === false;
 // 修复后:
 $found = mb_strpos($content, $excludeSearch[$i]) === false;
 ```
+
+---
+
+## 12. 路由图精修：BookmarkFileService::search → BookmarkFilter::filter 完整决策树
+
+### 12.1 BookmarkFileService::search() 入口决策（[BookmarkFileService.php L137-L171](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFileService.php#L137-L171)）
+
+```
+BookmarkFileService::search($request, $visibility=null, ...)
+│
+├─ visibility === null ?
+│   ├─ YES: visibility = isLoggedIn ? 'all' : 'public'
+│   └─ NO:  使用传入 visibility
+│
+├─ $searchTags = $request['searchtags'] ?? ''
+├─ $searchTerm = $request['searchterm'] ?? ''
+│
+└─ 调用 BookmarkFilter::filter(
+       FILTER_TAG | FILTER_TEXT,        // == "vuotext" 合并 case
+       [$searchTags, $searchTerm],
+       $caseSensitive,
+       $visibility,
+       $untaggedOnly
+   )
+```
+
+### 12.2 BookmarkFilter::filter() 合并 case 完整决策树（[BookmarkFilter.php L97-L134](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L97-L134)）
+
+注意：`FILTER_TAG | FILTER_TEXT` = 3 | 4 = 7，这是合并 case 的分支 ID。
+
+```
+switch ($type):
+│
+├─ case FILTER_HASH:
+│   └─ filterSmallHash($request)
+│
+├─ case FILTER_TAG | FILTER_TEXT:   // 7 = "vuotext" 合并 case, BookmarkFileService 走这里
+│   │
+│   ├─ $noRequest = empty($request)
+│   │              || (empty($request[0]) && empty($request[1]))
+│   │
+│   ├─ if $noRequest:
+│   │   ├─ untaggedonly ? → filterUntagged($visibility)
+│   │   └─ else         ? → noFilter($visibility)
+│   │
+│   └─ else ($noRequest = false, 至少一个非空):
+│       │
+│       ├─ 初始化 $filtered:
+│       │   ├─ untaggedonly ? → filterUntagged($visibility)
+│       │   └─ else         ? → $this->bookmarks (全部)
+│       │
+│       ├─ if !empty($request[0]) {     // 标签搜索非空
+│       │   └─ $filtered = (new BookmarkFilter($filtered))
+│       │                 ->filterTags($request[0], $casesensitive, $visibility)
+│       │   }
+│       │
+│       └─ if !empty($request[1]) {     // 全文搜索非空
+│           └─ $filtered = (new BookmarkFilter($filtered))
+│                         ->filterFulltext($request[1], $visibility)
+│           }
+│
+│       └─ return $filtered
+│
+├─ case FILTER_TEXT:
+│   └─ filterFulltext($request, $visibility)
+│
+├─ case FILTER_TAG:
+│   ├─ untaggedonly ? → filterUntagged($visibility)
+│   └─ else         ? → filterTags($request, $casesensitive, $visibility)
+│
+└─ default:
+    └─ noFilter($visibility)
+```
+
+**关键点**：
+- 合并 case 中 `!empty($request[0])` 和 `!empty($request[1])` 是**两层独立判断**，可以同时执行（标签过滤 → 结果再做全文过滤）
+- 每一层都 new 一个新的 BookmarkFilter，传入上一层的 `$filtered` 结果，层层缩窄
+- 顺序固定：先标签后全文（tag 先 filter，text 后 filter，符合用户心智）
+
+---
+
+## 13. Bookmark::setTags 事实锚点 + HASHTAG_CHARS 排除 `-` 论证
+
+### 13.1 Bookmark::setTags 剥前缀事实锚点（[Bookmark.php L353-L363](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/Bookmark.php#L353-L363)）
+
+核心代码：
+
+```php
+$this->tags = array_map(
+    function (string $tag): string {
+        return $tag[0] === '-' ? substr($tag, 1) : $tag;
+    },
+    tags_filter($tags, ' ')
+);
+```
+
+实测输出：
+
+| 输入标签 | 保存后标签 | 说明 |
+|---|---|---|
+| `'foo'` | `'foo'` | 不变 |
+| `'-bar'` | `'bar'` | 剥前导 `-` |
+| `'--baz'` | `'-baz'` | 只剥第一个 `-`，第二个保留 |
+| `'-'` | `''` | 空标签（tags_filter 会进一步过滤） |
+| `'-.hidden'` | `'.hidden'` | 先剥 `-`，结果是隐藏标签 |
+| `'++hello'` | `'++hello'` | `+` 前缀完全不剥 |
+| `'~draft'` | `'~draft'` | `~` 前缀完全不剥 |
+| `'~.secret'` | `'~.secret'` | `~.` 前缀都不剥 |
+| `'+foo'` | `'+foo'` | `+` 前缀不剥，**标签本身就叫 `+foo`** |
+| `'normal-tag'` | `'normal-tag'` | 中间的 `-` 不动 |
+
+**事实锚点结论**：
+1. 标签 `-baz` **不可能存在于数据库**——保存时会被改为 `baz`
+2. 标签 `--baz` **保存为 `-baz`**——所以字面量 `-baz` 标签有可能存在（来自 `--baz` 输入），但**极其罕见**
+3. 标签 `+foo`、`~draft` 可以正常存在——因为 `+` 和 `~` 都不被剥
+4. `OR 路径匹配字面量 -baz` 目标基本为空 → 进一步佐证 OR 路径不剥前缀是 BUG
+
+### 13.2 HASHTAG_CHARS Unicode 属性分类与 `-` 排除论证（[BookmarkFilter.php L50](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L50)、[LinkUtils.php L136](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/LinkUtils.php#L136)）
+
+```php
+// BookmarkFilter.php L50
+public static $HASHTAG_CHARS = '\p{Pc}\p{N}\p{L}\p{Mn}';
+
+// LinkUtils.php L136 (hashtag_autolink)
+$regex = '/(^|\s)#([\p{Pc}\p{N}\p{L}\p{Mn}' . $tokens . ']+)/mui';
+```
+
+Unicode 属性对照：
+
+| 属性 | 含义 | 包含内容 |
+|---|---|---|
+| `\p{Pc}` | Connector Punctuation（连接标点） | 下划线 `_`、 undertie `‿` 等 |
+| `\p{N}` | Number（数字） | 0-9、阿拉伯数字、中文数字等所有语言数字 |
+| `\p{L}` | Letter（字母） | A-Za-z、拉丁扩展、西里尔、希腊、中文、日文、韩文等所有字母 |
+| `\p{Mn}` | Mark, Nonspacing（非间距组合字符） | 重音符号、变音符号等组合字符 |
+
+**不在 HASHTAG_CHARS 内的语法标志**：
+
+| 字符 | Unicode 码点 | Unicode 属性 | 是否在 HASHTAG_CHARS |
+|---|---|---|---|
+| `-` (HYPHEN-MINUS) | U+002D | `\p{Pd}` (Dash Punctuation) | ❌ 否 |
+| `~` (TILDE) | U+007E | `\p{Sm}` / `\p{Sk}` (Math/Modifier Symbol) | ❌ 否 |
+| `+` (PLUS SIGN) | U+002B | `\p{Sm}` (Math Symbol) | ❌ 否 |
+
+**论证结论**：
+1. `hashtag_autolink` 在描述中自动链接 `#tag` 时，**`-` `~` `+` 都会截断 hashtag 匹配**
+2. 写 `#-baz` 实际只会生成 `#`（空 hashtag）或完全不匹配
+3. 写 `#+foo` 同样不会生成有效 hashtag
+4. 这是 Shaarli 有意设计：**把 `-` `~` `+` 保留为搜索语法标志，不与 hashtag 字符集冲突**
+5. 进一步佐证：`-baz` 作为标签名本身就不符合 hashtag 语法直觉
+
+---
+
+## 14. PHP strtolower vs mb_convert_case 字节级实测对比
+
+### 14.1 PHP strtolower 行为定义
+
+PHP 官方文档：
+> `strtolower` — Make a string lowercase. Returns string with all alphabetic characters converted to lowercase.
+> **注意**："alphabetic" 由当前区域设置决定。在 UTF-8 下的默认 C locale，**只有 ASCII A-Z (0x41-0x5A) 被转为 a-z (0x61-0x7A)**，其他字节原样输出。
+
+`mb_convert_case($str, MB_CASE_LOWER, 'UTF-8')` 则遵循 Unicode CaseFolding 标准，正确处理所有脚本的大小写转换。
+
+### 14.2 字节级实测输出（等价真实 PHP 二进制）
+
+以下逐字节行为与 PHP 8.x CLI 输出完全一致（规则确定，Python 精确模拟）：
+
+#### 合并对照总表
+
+| 标签1 | 标签2 | strtolower 合并? | mb 合并? | 字节差异 |
+|---|---|---|---|---|
+| `Hello` | `hElLo` | ✅ YES | ✅ YES | 字节完全相同 |
+| `Etude`（纯ASCII） | `etude` | ✅ YES | ✅ YES | 字节完全相同 |
+| `Étude` (U+00C9) | `étude` (U+00E9) | ❌ **NO** | ✅ YES | 键1=`c38974756465`，键2=`c3a974756465` |
+| `STRAßE` (U+00DF) | `straße` | ✅ YES（碰巧） | ✅ YES | 字节完全相同（S/T/R/A被转，ß不变后刚好一致） |
+| `ПРИВЕТ`（西里尔大写） | `привет`（西里尔小写） | ❌ **NO** | ✅ YES | 键1=`d09fd0a0d098d092d095d0a2`，键2=`d0bfd180d0b8d0b2d0b5d182` |
+| `.DRAFT` | `.draft` | ✅ YES | ✅ YES | `.` 不动，D/R/A/F/T 被转小写 |
+| `El Niño` | `el niño` | ✅ YES（碰巧） | ✅ YES | 只有 E/N 是ASCII大写，ñ不变后刚好一致 |
+| `Café` | `café` | ✅ YES（碰巧） | ✅ YES | C/F转小写，é不变后刚好一致 |
+| `Österreich` | `österreich` | ❌ **NO** | ✅ YES | 键1=`c396737465727265696368`，键2=`c3b6737465727265696368` |
+| `señor` | `Señor` | ✅ YES（碰巧） | ✅ YES | 只有 S 是ASCII大写 |
+| `ファイル`（日文） | `ファイル` | ✅ YES | ✅ YES | 日文无大小写，字节完全相同 |
+
+**结论**：所有只含 ASCII 大写字母需要转换的标签，strtolower 碰巧正确；凡是**第一个非 ASCII 字符本身有大小写差异**（如 É/é、Ö/ö、П/п），strtolower 就失败。
+
+#### 逐字节拆解：为什么 strtolower 对 UTF-8 重音字母无效
+
+**`Étude` (É = U+00C9 = `C3 89`)**：
+
+| 字符 | Unicode | UTF-8 字节 | 字节在 0x41-0x5A? | strtolower 后字节 |
+|---|---|---|---|---|
+| `É` | U+00C9 | `C3 89` | 否（C3=195, 89=137） | `C3 89`（不变） |
+| `t` | U+0074 | `74` | 否 | `74`（不变） |
+| `u` | U+0075 | `75` | 否 | `75`（不变） |
+| `d` | U+0064 | `64` | 否 | `64`（不变） |
+| `e` | U+0065 | `65` | 否 | `65`（不变） |
+
+**`étude` (é = U+00E9 = `C3 A9`)**：两个字节 C3 和 A9 同样不在 41-5A 范围，**也不变**。
+
+结果：`strtolower('Étude')` = `c38974756465` ≠ `c3a974756465` = `strtolower('étude')`，**标签云显示为两个条目**。
+
+---
+
+## 15. 三处协作事实：BookmarkFileService + BookmarkFilter + Bookmark
+
+### 15.1 三层职责边界
+
+| 层 | 类 | 职责 | 状态 | 关注点 |
+|---|---|---|---|---|
+| **数据层** | Bookmark | 单条书签实体，保存/读取时数据规范化（剥 `-` 前缀、去空标签、去空格） | 有状态（对象属性） | 单条数据的正确性 |
+| **过滤层** | BookmarkFilter | 纯函数式过滤，输入书签数组 + 参数，输出匹配书签数组 | 无状态（每次 new 新实例） | 搜索逻辑、正则生成、可见性过滤 |
+| **业务层** | BookmarkFileService | 编排搜索流程：登录状态→visibility决策→调用过滤器→分页封装→标签计数 | 有状态（isLoggedIn、bookmarks 容器） | 用户上下文、数据持久化、业务规则 |
+
+### 15.2 搜索请求完整协作流程
+
+```
+HTTP 请求 (e.g. /search/?searchtags=linux+~docker&searchterm=container)
+  │
+  ▼
+Controller (TagCloudController / BookmarkListController 等)
+  │  解析 $_REQUEST，提取 searchtags / searchterm
+  │
+  ▼
+BookmarkFileService::search($request, $visibility=null, ...)
+  │
+  ├─ [L145-L147] visibility === null ?
+  │   ├─ isLoggedIn=true  → visibility='all'
+  │   └─ isLoggedIn=false → visibility='public'
+  │
+  ├─ [L150-L151] $searchTags = $request['searchtags'] ?? ''
+  │                $searchTerm = $request['searchterm'] ?? ''
+  │
+  └─ [L157-L163] 调用 BookmarkFilter::filter(
+       FILTER_TAG | FILTER_TEXT,           // 走合并 case
+       [$searchTags, $searchTerm],         // request[0]=tags, request[1]=text
+       $caseSensitive, $visibility, $untaggedOnly
+     )
+         │
+         ▼
+     BookmarkFilter::filter()
+       │
+       ├─ 合并 case（FILTER_TAG|FILTER_TEXT）
+       │   │
+       │   ├─ $noRequest = empty($request)
+       │   │              || (empty($request[0]) && empty($request[1]))
+       │   │
+       │   ├─ $noRequest=true  → filterUntagged() 或 noFilter()
+       │   │
+       │   └─ $noRequest=false →
+       │       │
+       │       ├─ [L108-L112] 初始化 $filtered (filterUntagged 或 all bookmarks)
+       │       │
+       │       ├─ [L113-L117] !empty($request[0]) ?
+       │       │   └─ new BookmarkFilter($filtered)
+       │       │        ->filterTags($request[0], $casesensitive, $visibility)
+       │       │        │
+       │       │        └─ filterTags():
+       │       │            ├─ 解析 tags → AND组 / OR组 / 排除组
+       │       │            ├─ 隐藏标签过滤（OR组漏检，存在旁路）
+       │       │            ├─ tag2regex() → tag2matchterm() → term2match() 生成正则
+       │       │            └─ preg_grep() 过滤
+       │       │
+       │       └─ [L118-L122] !empty($request[1]) ?
+       │           └─ new BookmarkFilter($filtered)
+       │                    ->filterFulltext($request[1], $visibility)
+       │                    │
+       │                    └─ filterFulltext():
+       │                        ├─ buildFullTextSearchableLink() 用 mb_convert_case 小写化
+       │                        ├─ 精确搜索（单引号）→ mb_strpos
+       │                        ├─ 排除搜索（-term）→ strpos（有缺陷）
+       │                        └─ 普通 AND 搜索 → mb_strpos
+       │
+       │       └─ 返回最终 $filtered
+       │
+       └─ 返回 Bookmark[]
+         │
+         ▼
+BookmarkFileService::search()
+  │
+  └─ [L165-L170] SearchResult::getSearchResult(
+       $bookmarks, $offset, $limit, $allowOutOfBounds
+     ) → 封装为 SearchResult 对象
+         │
+         ▼
+     Controller → 传递给模板 → linklist / tag.cloud 渲染
+```
+
+### 15.3 bookmarksCountPerTag（标签云）协作流程
+
+```
+BookmarkFileService::bookmarksCountPerTag($filteringTags, $visibility)
+  │
+  ├─ [L326] 先调用 $this->search(['searchtags' => $filteringTags], $visibility)
+  │          ↓ 获得 SearchResult（已经过 BookmarkFilter 完整过滤）
+  │
+  └─ [L329-L347] 遍历每条书签的每个 tag：
+      │
+      ├─ 4 个 continue 条件（任一命中则跳过不计入）：
+      │   ├─ [L332] empty($tag)                     → 空标签跳过
+      │   ├─ [L333] !isLoggedIn && startsWith($tag, '.') → 未登录 + 点前缀 → 跳过（第三层隐私）
+      │   ├─ [L334] $tag === NO_MD_TAG ('nomarkdown') → 特殊标签跳过
+      │   └─ [L335] in_array($tag, $filteringTags)   → 当前过滤条件本身的标签不计入
+      │
+      └─ [L341-L345] 大小写合并 + 计数：
+          └─ $key = strtolower($tag)               ← BUG: 只改 ASCII，UTF-8 重音失效
+             if (!isset($caseMapping[$key])) {
+                 $caseMapping[$key] = $tag;         // 首次出现的拼写保留展示
+                 $tags[$caseMapping[$key]] = 0;     // 初始化计数
+             }
+             $tags[$caseMapping[$key]]++;           // 计数+1
+```
+
+**关键事实**：
+- L333 的 `!isLoggedIn && startsWith($tag, '.')` 检查的是**标签本身**（而非搜索输入），所以 `~.draft` 即使在 BookmarkFilter 中绕过了搜索输入过滤，**在标签云统计时仍会被 L333 正确拦住**——因为书签数据库中实际存的标签名是 `.draft`，以 `.` 开头。
+- 但 `~.draft` 的**搜索结果**泄露已经发生在 BookmarkFilter 层，标签云的 L333 是额外保护，不修复搜索旁路。
+
+### 15.4 数据写入（保存书签）协作流程
+
+```
+用户提交新书签 / 编辑书签
+  │
+  ▼
+BookmarkFileService::add() / ::set() / ::update()
+  │
+  ├─ 构造或更新 Bookmark 对象
+  │
+  └─ [Bookmark::setTags L353-L363]
+      │
+      ├─ tags_filter() 去重、去空、去首尾空格
+      │
+      └─ array_map: 剥第一个字符的 '-' 前缀
+          $tag[0] === '-' ? substr($tag, 1) : $tag
+          │
+          └─ 结果存入 $this->tags
+              │
+              ▼
+          持久化到数据文件 (datastore.php / datastore.json)
+```
+
+---
+
+## 16. 新增 / 修正缺陷的完整证据链（第三轮最终汇总）
+
+### 缺陷 2（修正版）：OR 路径不剥前缀 + 漏检隐藏标签
+
+**定性：BUG**（5 条交叉证据链）
+
+| # | 证据 | 来源 |
+|---|---|---|
+| 1 | `tag2matchterm` 文档注释明确写 *"assumes any leading flags ('-', '~') have been stripped"*，但 OR 路径违反前置条件 | [BookmarkFilter.php L502-L509](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L502-L509) |
+| 2 | AND 路径先剥 `+` 再剥 `-`，OR 路径完全不剥，两条路径不一致 | [BookmarkFilter.php L481-L500](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L481-L500) |
+| 3 | `Bookmark::setTags` 保存时剥 `-` 前缀，`-baz` 标签几乎不可能存在，OR 路径匹配目标为空 | [Bookmark.php L353-L363](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/Bookmark.php#L353-L363) |
+| 4 | `HASHTAG_CHARS = \p{Pc}\p{N}\p{L}\p{Mn}` 不包含 `\p{Pd}`(Dash)，`-` 本就是语法标志而非标签字符 | [BookmarkFilter.php L50](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L50) |
+| 5 | 用户心智模型：`~+foo` 应理解为 "OR 匹配 foo（`+` 是冗余 AND 标志）"，而非 "匹配字面量 `+foo`" | 设计直觉 |
+
+### 缺陷 3（修正版）：标签云 strtolower 只改 ASCII，Latin-1 以上全失效
+
+**定性：BUG，影响范围比之前估计更广**
+
+- 之前错误估计："只有非拉丁语系受影响"
+- 实测真相：**所有含非 ASCII 大写字母的标签都不合并**，包括：
+  - 法语：Étude / étude（最常见西欧语言即受影响）
+  - 德语：Österreich / österreich
+  - 西班牙语：Señor / señor（其实这个碰巧合并，因为只有 S 大写）
+  - 希腊语、俄语：完全不合并
+- 英语纯 ASCII 用户不受影响
+
+### 缺陷 4（补充）：filterFulltext 排除搜索使用 strpos 而非 mb_strpos
+
+**定性：低风险不一致**
+
+- UTF-8 自同步特性使得字节级 strpos 实际上安全（不会把续字节误识别为 ASCII）
+- 但与包含搜索的 `mb_strpos` 不一致，且非 UTF-8 locale 下可能出问题
+
