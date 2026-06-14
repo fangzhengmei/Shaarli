@@ -235,13 +235,78 @@ if ($visibility === 'all') {
 - `public` 可见性下自动过滤掉以 `.` 开头的标签搜索
 - 仅登录用户/API 可搜索隐藏标签
 
-### 4.4 私有分享链接
+### 4.4 私有分享链接（仅前端页面，API 路由不暴露）
 
-[BookmarkFileService::findByHash()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/bookmark/BookmarkFileService.php#L110-L124) 支持私有链接分享：
+**回核结论：API 路由**不**暴露 privateKey 访问私有书签的能力。privateKey 是前端页面（Visitor/Public 路由）独享的机制。**
 
-- 私有书签可通过 `privateKey` 参数访问
-- 未登录用户提供正确的 `privateKey` 也可查看单条私有书签
-- Key 不匹配时抛出 `BookmarkNotFoundException`
+#### 4.4.1 前端页面路由（privateKey 生效的地方）
+
+**生成页面路由**：[index.php L149](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/index.php#L149)
+```php
+$this->get('/admin/shaare/private/{hash}', '\Shaarli\Front\Controller\Admin\ShaareManageController:sharePrivate');
+```
+
+**生成逻辑**：[ShaareManageController::sharePrivate()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/front/controller/admin/ShaareManageController.php#L184-L205)
+1. 校验 XSRF token（`$this->checkToken($request)`）
+2. 若书签是 public，直接重定向到 `/shaare/{hash}`
+3. 若书签无 `private_key`，生成 `bin2hex(random_bytes(16))`（32 字符十六进制）并保存
+4. 重定向到 `/shaare/{hash}?key=<private_key>`
+
+**访问页面路由**：[BookmarkListController::permalink()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/front/controller/visitor/BookmarkListController.php#L129-L160)
+```php
+$privateKey = $request->getParam('key');
+$bookmark = $this->container->bookmarkService->findByHash($args['hash'], $privateKey);
+```
+
+#### 4.4.2 服务层实现
+
+[BookmarkFileService::findByHash()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/bookmark/BookmarkFileService.php#L110-L124)
+```php
+public function findByHash(string $hash, string $privateKey = null): Bookmark
+{
+    $first = current(
+        $this->bookmarks->filter(function (Bookmark $bookmark) use ($hash, $privateKey) {
+            return $bookmark->getShortUrl() === $hash
+                && (!$bookmark->isPrivate()
+                    || true === $this->isLoggedIn
+                    || (!empty($privateKey)
+                        && $privateKey === $bookmark->getAdditionalContentEntry('private_key'))
+                );
+        })
+    );
+    if (false === $first) {
+        throw new BookmarkNotFoundException();
+    }
+    return $first;
+}
+```
+
+**访问条件（任一满足即可）**：
+1. 书签本身是公开的（`!$bookmark->isPrivate()`）
+2. 已登录（`true === $this->isLoggedIn`）—— API 场景始终为 true
+3. 提供正确的 `privateKey` 且与书签存储的 `private_key` 匹配
+
+#### 4.4.3 API 路由不暴露 privateKey
+
+**代码事实核查**：对 `application/api/` 目录搜索 `findByHash|privateKey|private_key`，**零匹配**。
+
+API 书签查询全部走 `id` 路径：
+- [Links::getLink()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/controllers/Links.php#L97-L107)：通过 `$args['id']` 用 `is_integer_mixed()` 校验后调用 `$this->bookmarkService->get($id)`
+- [Links::getLinks()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/controllers/Links.php#L36-L84)：通过 `search()` 按可见性过滤
+
+API 格式化输出 [ApiUtils::formatLink()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiUtils.php#L65-L86) 的字段列表为：
+`id, url, shorturl, title, description, tags, private, created, updated`
+——**不含 private_key 字段**，也不接受 `key` 查询参数。
+
+#### 4.4.4 结论
+
+| 维度 | 前端 Visitor 路由 `/shaare/{hash}?key=...` | API 路由 `/api/v1/links` |
+|------|------------------------------------------|------------------------|
+| 身份标识 | Session Cookie (未登录) | JWT Authorization 头 (必须登录) |
+| 私有书签访问 | privateKey 查询参数 | JWT 鉴权后直接访问 |
+| 定位方式 | 短链接 hash (shorturl) | 整数书签 ID (id) |
+| privateKey 是否可用 | ✅ 是 | ❌ 否 |
+| BookmarkFileService::isLoggedIn | 取决于 LoginManager | 始终 `true` |
 
 ### 4.5 公开链接隐藏配置
 
