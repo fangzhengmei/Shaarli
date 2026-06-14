@@ -205,45 +205,314 @@ findByUrl($bkm['url'])
 
 ---
 
-## 5. 私有标记处理
+## 5. 私有标记处理：三态 public/private/null 落点全链路
 
-### 5.1 导入时的隐私决策树
+### 5.1 按代码执行顺序的五站链路
 
-在 [NetscapeBookmarkUtils.php#L132-L141](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/netscape/NetscapeBookmarkUtils.php#L132-L141) 中实现三级隐私策略：
+从 Netscape 书签文件到 Bookmark::isPrivate()，一共经过 5 个关键节点：
 
 ```
-$post['privacy'] 参数
-        │
-        ├── 'private' ──► 全部强制设为私有 (isPrivate = true)
-        ├── 'public'  ──► 全部强制设为公开 (isPrivate = false)
-        └── default/其他 ──► 使用文件中的 PRIVATE 属性
-                              │
-                              ├── isset($bkm['public']) && !$bkm['public'] ──► true (私有)
-                              └── 其他情况 ──► false (默认公开)
+第1站            第2站            第3站                 第4站              第5站
+decode() 初始化 → 属性匹配 → NetscapeBookmarkUtils决策 → setPrivate() 归一化 → isPrivate()
+   null       true/false/null     $isPrivate(bool)       $this->private     return bool
 ```
 
-Netscape 格式中的 `PRIVATE="1"` 属性由解析库转换为 `$bkm['public'] = false`。
+---
 
-### 5.2 验证测试用例
+### 5.2 第 1 站：decode() 初始化 —— public = null
 
-测试覆盖在 [BookmarkImportTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tests/netscape/BookmarkImportTest.php)：
-- `testImportKeepPrivacy` (L366-L404)：保留文件中的隐私设置
-- `testImportAsPublic` (L409-L422)：全部强制公开
-- `testImportAsPrivate` (L427-L440)：全部强制私有
-- `testOverwriteAsPublic` (L445-L475)：二次导入时覆盖隐私为公开
-- `testOverwriteAsPrivate` (L480-L510)：二次导入时覆盖隐私为私有
+[NetscapeBookmarkDecoder 第三方库] decode() 方法开头：
 
-### 5.3 导出时的私有标记
+```php
+$item = [
+    'u'       => '',   // url
+    't'       => [],   // tags
+    'n'       => '',   // note (description)
+    't'       => '',   // title
+    'public'  => null, // <-- 初始化为 null
+    'created'  => 0,
+];
+```
 
-在导出模板 [export.bookmarks.html#L9](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tpl/default/export.bookmarks.html#L9) 中：
+**起点状态：`$item['public'] = null`**
+
+---
+
+### 5.3 第 2 站：属性匹配 —— true / false / null 三态分支
+
+ decode() 逐行解析 `<A>` 标签时：
+
+```php
+// 正向属性：public / published / pub
+if (preg_match('/(public|published|pub)="(.*?)"/i', $line, $public)) {
+    $item['public'] = $this->parseBoolean($public[2]);
+}
+// 反向属性：private / shared
+elseif (preg_match('/(private|shared)="(.*?)"/i', $line, $private)) {
+    $item['public'] = !$this->parseBoolean($private[2]);
+}
+// 都没匹配到：保持 null
+```
+
+**三种可能输出：**
+
+| 匹配到的属性 | 属性值 | parseBoolean 结果 | $item['public'] | 含义 |
+|------------|--------|-----------------|-----------------|------|
+| `PUBLIC="1"` | `'1'` | `true` | `true` | 公开 |
+| `PUBLIC="0"` | `'0'` | `false` | `false` | 私有 |
+| `PRIVATE="1"` | `'1'` | `true` | `!true = false` | 私有 |
+| `PRIVATE="0"` | `'0'` | `false` | `!false = true` | 公开 |
+| 都没匹配到 | — | — | `null` | 未指定 |
+
+> 注意：`PRIVATE="1"` 经过一次取反 `!`，最终落到 `public = false`，语义保持一致。
+
+测试文件 [netscape_basic.htm](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tests/netscape/input/netscape_basic.htm) 中两书签经过此站后：
+- 书签 1（`PRIVATE="1"`）→ `$bkm['public'] = false`
+- 书签 2（`PRIVATE="0"`）→ `$bkm['public'] = true`
+
+---
+
+### 5.4 第 3 站：NetscapeBookmarkUtils 三级决策 —— 核心判定式
+
+[NetscapeBookmarkUtils.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/netscape/NetscapeBookmarkUtils.php#L131-L141) L131-L141：
+
+```php
+if ($forcedPrivateStatus == 'private') {
+    $isPrivate = true;                          // 分支 1：全部强制私有
+} elseif ($forcedPrivateStatus == 'public') {
+    $isPrivate = false;                         // 分支 2：全部强制公开
+} else {
+    $isPrivate = isset($bkm['public']) && !$bkm['public'];  // 分支 3：使用文件值
+}
+```
+
+**分支 1 / 2 很直接，重点拆分支 3 的判定式：**
+
+```
+isset($bkm['public']) && !$bkm['public']
+```
+
+这个式子对三态的输出逐一推导：
+
+#### 态 1：$bkm['public'] = true（文件指定公开）
+
+```
+isset(true)   → true
+!true         → false
+true && false → false
+
+$isPrivate = false  →  公开
+```
+
+#### 态 2：$bkm['public'] = false（文件指定私有）
+
+```
+isset(false)  → true   （注意：isset 对 false 变量也返回 true，因为变量已定义）
+!false        → true
+true && true  → true
+
+$isPrivate = true   →  私有
+```
+
+#### 态 3：$bkm['public'] = null（文件未指定）
+
+```
+isset(null)   → false
+&& 短路，后面不算
+整体结果      → false
+
+$isPrivate = false  →  公开（默认）
+```
+
+**三态落点对照表：**
+
+| $bkm['public'] | isset() | 取反后 | && 结果 | $isPrivate | 最终状态 |
+|---------------|---------|--------|---------|-----------|---------|
+| `true` | ✅ true | false | **false** | `false` | 公开 |
+| `false` | ✅ true | true | **true** | `true` | 私有 |
+| `null` | ❌ false | —（短路） | **false** | `false` | 公开（默认） |
+
+**记忆口诀：** 只有 `false` 才私有，`true` 和 `null` 都公开。
+
+---
+
+### 5.5 第 4 站：setPrivate() —— null → false 归一化
+
+[Bookmark.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/Bookmark.php#L329-L334) L329-L334：
+
+```php
+public function setPrivate(?bool $private): Bookmark
+{
+    $this->private = $private ? true : false;
+    return $this;
+}
+```
+
+三态输入 → 内部存储：
+
+| 传入 $private | $this->private | 说明 |
+|--------------|----------------|------|
+| `true` | `true` | 私有 |
+| `false` | `false` | 公开 |
+| `null` | `false` | null 被三元运算符转为 false |
+
+> 注意：`$private ? true : false` 中 `null` 算 falsy 值，所以输出 `false`。
+
+---
+
+### 5.6 第 5 站：isPrivate() —— 最终输出
+
+[Bookmark.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/Bookmark.php#L317-L320) L317-L320：
+
+```php
+public function isPrivate(): bool
+{
+    return $this->private ? true : false;
+}
+```
+
+直接返回内部存储的布尔值。
+
+---
+
+### 5.7 三态全链路汇总表
+
+| 环节 | public = true | public = false | public = null |
+|------|--------------|---------------|---------------|
+| 第1站：decode 初始化 | —（还没到） | —（还没到） | `null` ✅ |
+| 第2站：属性匹配 | `true` | `false` | `null`（保持） |
+| 第3站：Utils 决策（default 模式） | `$isPrivate = false`（公开） | `$isPrivate = true`（私有） | `$isPrivate = false`（默认公开） |
+| 第4站：setPrivate 归一化 | `$this->private = false` | `$this->private = true` | `$this->private = false` |
+| 第5站：isPrivate() | `false` → 公开 | `true` → 私有 | `false` → 公开 |
+
+---
+
+### 5.8 四个测试用例逐态对账
+
+测试文件：[BookmarkImportTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tests/netscape/BookmarkImportTest.php)
+
+输入：`netscape_basic.htm` 两书签
+- 书签 1：`PRIVATE="1"` → $bkm['public'] = **false**（私有标记）
+- 书签 2：`PRIVATE="0"` → $bkm['public'] = **true**（公开标记）
+
+---
+
+#### 用例 1：testImportDefaultPrivacyNoPost L324-L361
+
+**POST 参数：** `[]`（空数组）
+
+**$forcedPrivateStatus 计算：**
+```php
+$forcedPrivateStatus = !empty($post['privacy']) ? (string)$post['privacy'] : null;
+// empty($post['privacy']) → empty(null) → true
+// → $forcedPrivateStatus = null
+```
+
+**走分支：** else 分支（既不是 'private' 也不是 'public'）
+
+**书签 1（public=false）：**
+```
+isset(false) && !false = true && true = true
+→ $isPrivate = true
+→ setPrivate(true) → $this->private = true
+→ isPrivate() = true  →  私有
+```
+断言：`$this->assertTrue($bookmark->isPrivate());` ✅
+
+**书签 2（public=true）：**
+```
+isset(true) && !true = true && false = false
+→ $isPrivate = false
+→ setPrivate(false) → $this->private = false
+→ isPrivate() = false  →  公开
+```
+断言：`$this->assertFalse($bookmark->isPrivate());` ✅
+
+**私有计数：** 1 个 → `assertEquals(1, count(PRIVATE))` ✅
+
+---
+
+#### 用例 2：testImportKeepPrivacy L366-L404
+
+**POST 参数：** `['privacy' => 'default']`
+
+**$forcedPrivateStatus 计算：**
+```php
+!empty('default') → true
+→ $forcedPrivateStatus = 'default'
+```
+
+**走分支：** else 分支（'default' 既不是 'private' 也不是 'public'）
+
+**结果与用例 1 完全相同：**
+- 书签 1 → 私有
+- 书签 2 → 公开
+- 私有计数：1 ✅
+
+---
+
+#### 用例 3：testImportAsPublic L409-L422
+
+**POST 参数：** `['privacy' => 'public']`
+
+**走分支：** elseif 分支 → `$isPrivate = false`
+
+**两个书签全部强制公开：**
+- 书签 1（原本私有）→ 被覆盖为公开
+- 书签 2（原本公开）→ 保持公开
+- 私有计数：0 ✅
+
+断言：
+```php
+$this->assertFalse($this->bookmarkService->get(0)->isPrivate());
+$this->assertFalse($this->bookmarkService->get(1)->isPrivate());
+```
+✅
+
+---
+
+#### 用例 4：testImportAsPrivate L427-L440
+
+**POST 参数：** `['privacy' => 'private']`
+
+**走分支：** if 分支 → `$isPrivate = true`
+
+**两个书签全部强制私有：**
+- 书签 1（原本私有）→ 保持私有
+- 书签 2（原本公开）→ 被覆盖为私有
+- 私有计数：2 ✅
+
+断言：
+```php
+$this->assertTrue($this->bookmarkService->get(0)->isPrivate());
+$this->assertTrue($this->bookmarkService->get(1)->isPrivate());
+```
+✅
+
+---
+
+### 5.9 四用例决策矩阵汇总
+
+| 测试方法 | POST privacy | 走哪个分支 | 书签 1（原私有） | 书签 2（原公开） | 私有总数 |
+|---------|-------------|-----------|-----------------|-----------------|---------|
+| testImportDefaultPrivacyNoPost | 无（null） | else（default） | 私有 ✅ | 公开 ✅ | 1 |
+| testImportKeepPrivacy | `'default'` | else（default） | 私有 ✅ | 公开 ✅ | 1 |
+| testImportAsPublic | `'public'` | elseif（强制公开） | 公开 ✅ | 公开 ✅ | 0 |
+| testImportAsPrivate | `'private'` | if（强制私有） | 私有 ✅ | 私有 ✅ | 2 |
+
+---
+
+### 5.10 导出时的私有标记
+
+在导出模板 [export.bookmarks.html](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tpl/default/export.bookmarks.html) 中：
 
 ```html
 PRIVATE="{$private}"
 ```
 
-其中 `$private = intval($value.private)`，输出为 `"0"` 或 `"1"`，与 Netscape 标准兼容。
-
----
+其中 `$private = intval($value['private'])`，输出为 `"0"` 或 `"1"`，与 Netscape 标准兼容：
+- `isPrivate() = false` → `PRIVATE="0"` → 公开
+- `isPrivate() = true` → `PRIVATE="1"` → 私有
 
 ## 6. 编码边界
 
