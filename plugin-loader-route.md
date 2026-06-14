@@ -193,7 +193,7 @@ if ($routes !== null) {
 }
 ```
 
-[PluginInvalidRouteException](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/plugin/exception/PluginInvalidRouteException.php) 是特定异常类，但**不携带插件名参数**（其构造函数忽略参数，硬编码消息为 "trying to register invalid route."）。
+[PluginInvalidRouteException](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/plugin/exception/PluginInvalidRouteException.php) 是特定异常类，但**不携带插件名参数**（其构造器签名 `__construct()` **无参数声明**，但 throw 侧却传入 `$pluginName`——PHP 静默丢弃多余参数（PHP 8.0+ 废弃此行为，PHP 9.0 计划移除），异常消息硬编码为 "trying to register invalid route."）。
 
 **真实风险链**：
 
@@ -322,8 +322,8 @@ $data = hook_C($data, $conf);   // C 接收 B 的结果，再修改
 | Hook 名 | 触发位置 | $data 初始内容 | 执行时数据状态 |
 |---------|----------|----------------|--------------|
 | `save_plugin_parameters` | [PluginsController.php L61](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/PluginsController.php#L61) | **整个 POST 数组引用** `$parameters = $request->getParams()` | 在 `escape()` 之前执行，值为原始用户输入；插件可修改任意字段 |
-| `save_link` | [ShaareManageController.php L131](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaareManageController.php#L131)、[L173](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaareManageController.php#L173)、[L274](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaareManageController.php#L274) | `$formatter->format($bookmark)` — 已**整体 escape 过的书签数组** | Hook 返回值 → `$bookmark->fromArray($data)` → 写入数据库；若插件对已转义字符串再处理后 return，会产生双转义或正则失效 |
-| `delete_link` | [ShaareManageController.php L55](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaareManageController.php#L55) | `$formatter->format($bookmark)` — 已格式化的书签数组 | 在 `bookmarkService->remove()` 之前执行；demo_plugin 在此 Hook 中直接 `exit()` 证明此处可终止整个请求 |
+| `save_link` | [ShaarePublishController.php L133](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaarePublishController.php#L133)（**书签发布/编辑主入口**）+ [ShaareManageController.php L131](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaareManageController.php#L131)（可见性切换）、[L173](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaareManageController.php#L173)（置顶）、[L274](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaareManageController.php#L274)（标签批量操作） | `$formatter->format($bookmark)` — 使用 `raw` 格式化器，**未做 HTML 转义** | Hook 返回值 → `$bookmark->fromArray($data)` → 写入数据库；数据为原始未转义字符串，插件可自由修改；但返回值直接写库无二次转义保护 |
+| `delete_link` | [ShaareManageController.php L55](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaareManageController.php#L55) | `$formatter->format($bookmark)` — 同样使用 `raw` 格式化器，**未做 HTML 转义** | 在 `bookmarkService->remove()` 之前执行；demo_plugin 在此 Hook 中直接 `exit()` 证明此处可终止整个请求（等同于 veto 权限） |
 
 #### 过滤类 Hook（不走 executeHooks，独立实现）
 
@@ -337,7 +337,7 @@ $data = hook_C($data, $conf);   // C 接收 B 的结果，再修改
 |------|------|
 | **键名冲突即覆盖** | 两个插件向 `$data['buttons_toolbar'][]` 追加元素是安全的，但如果都写 `$data['custom_key'] = ...`，后者覆盖前者，无任何警告 |
 | **未 return 导致数据丢失** | 插件若在 Hook 函数中忘记 `return $data`，`call_user_func` 返回 `null`，后续所有插件收到 `null`，整个管道数据被清空 |
-| **类型污染** | 一个插件返回非数组类型（如 `true`/字符串），导致后续插件对 `$data` 做数组操作时产生 `TypeError`，该错误会被 catch 吞掉但后续插件不执行 |
+| **类型污染** | 一个插件返回非数组类型（如 `true`/字符串），导致后续插件对 `$data` 做数组操作时产生 `TypeError`，该错误会被 catch 吞掉，形成"类型污染链"——`$data` 被赋值为非数组后，后续每个插件对 `$data` 做数组操作都触发 TypeError 被 catch，但 `$data` 始终无法恢复为数组，最终 executeHooks 返回非数组值，调用方出错。⚠ 此处与 3.3 节"异常时 `$data` 保留前序值"的关键区别：**异常发生在 Hook 函数内部**时赋值未完成→`$data`保留前序值（正确）；**类型污染是赋值已完成**→`$data`已被非数组值覆盖（无法恢复） |
 | **上下文元数据冲突** | 注入的 `_PAGE_`、`_LOGGEDIN_` 等 5 个键若插件本身使用同名键，会被覆盖后再 unset，导致插件数据丢失 |
 | **save_link 返回值直接写库** | `$bookmark->fromArray($data)` 不做额外转义，插件若在 Hook 中手动 `unescape()` 了某个字段后 return，会把未转义 HTML 直接写入数据库 |
 
@@ -525,7 +525,7 @@ function unescape($str) {
 | **键名也被转义** | `escape()` 递归处理数组时键名也 escape，若插件在 `save_plugin_parameters` Hook 中向 POST 添加了含特殊字符的字段名，被转义后 `conf->set('plugins.<转义后键名>', ...)`，后续读取时必须用同样转义后的键名才能找到 |
 | **save_plugin_parameters Hook 在 escape 之前执行** | [PluginsController.php L59-L68](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/PluginsController.php#L59-L68)：Hook 执行早于 escape，插件若在 Hook 中把参数值改成嵌套数组（含对象），escape 的数组递归会遍历并转义所有子元素，可能破坏插件预期的数据结构 |
 | **Markdown 格式化器反向 unescape** | [BookmarkMarkdownFormatter.php L231](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/formatter/BookmarkMarkdownFormatter.php#L231) 明确调用 `unescape()`，说明至少一条渲染链路假定了"存储时已转义"；但插件输出不走这条链路，导致相同存储值在不同渲染路径下的表现不一致 |
-| **save_link Hook 接收已 escape 的数组** | [ShaarePublishController](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaarePublishController.php) 在保存书签时先对整个书签数组执行 `escape()`，再传给 `save_link` Hook；若插件在 Hook 中对字段做字符串操作（如 `preg_replace('/<script>/' ...)`），操作的是已转义的 `&lt;script&gt;` 文本，正则匹配会失败，插件逻辑静默失效 |
+| **save_link Hook 接收 raw 格式化数据（未 escape）** | [ShaarePublishController.php L131-L133](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaarePublishController.php#L131-L133) 在保存书签时使用 `$this->getFormatter('raw')` 格式化书签，**未做 escape**，再传给 `save_link` Hook；[BookmarkRawFormatter](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/formatter/BookmarkRawFormatter.php) 的类文档明确警告"Warning: Do NOT use this for HTML content as it can introduce XSS vulnerabilities"；插件在 Hook 中对字段的操作是作用于原始未转义字符串，正则匹配可以正常工作；但 Hook 返回值通过 `$bookmark->fromArray($data)` 直接写库，**无任何 HTML 转义**，恶意插件可向数据库注入原始 HTML |
 | **delete_link 触发顺序敏感** | `save_link` 执行在 `bookmarkService->set()` 之前（返回值会被 `fromArray()` 反向写回对象），而 `delete_link` 执行在 `bookmarkService->remove()` 之前——但 demo_plugin 中 `hook_demo_plugin_delete_link()` 直接 `exit()`，说明插件可以通过终止请求来**阻止删除操作**（等同于 veto 权限），而这个能力在官方文档中并未说明 |
 
 ---
@@ -703,7 +703,7 @@ class DemoPluginController extends ShaarliAdminController
 |--------|------|------|
 | **插件路由默认公开（非严格模式）** | [index.php L182](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/index.php#L182) | `/plugin/*` 组只加了 `ShaarliMiddleware`，不含管理员校验。`hide_public_links=false` 时未登录用户可直接访问所有插件自定义路由 |
 | **继承 ShaarliAdminController ≠ 自动鉴权** | 插件路由组挂载方式 | 即使控制器类继承了 Admin 基类，只要不挂在 `/admin` 组下，`ShaarliAdminMiddleware` 就不会执行 |
-| **_init 阶段写配置** | 各插件 `_init()` | 插件可在 `_init()` 中调用 `$conf->set('credentials.hash', ...)` 甚至 `$conf->write(true)` 重置管理员密码，此时登录会话已建立但 CSRF token 检查不适用 |
+| **_init 阶段写配置（每次请求执行）** | 各插件 `_init()` | 插件可在 `_init()` 中调用 `$conf->set('credentials.hash', ...)` 甚至 `$conf->write(true)` 重置管理员密码；`write(true)` 的 `true` 参数由插件自行传入，不是框架鉴权结果（详见 7.5 节）；且 `_init()` 每次请求都执行，恶意插件可在管理员修改密码后立即覆盖 |
 | **Hook 接收 Conf 引用** | [PluginManager.php L139](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/plugin/PluginManager.php#L139) | **每个 executeHooks 调用**都把 `$this->conf` 作为第二参数传给插件，插件可在任意 Hook（包括公开的 `render_includes` 在匿名用户访问时）中读取和修改全部配置 |
 | **save_plugin_parameters 无边界** | [PluginsController.php L61](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/PluginsController.php#L61) | 该 Hook 接收整个 POST 数据引用，可修改任何字段包括 CSRF token、order 等；执行早于 `checkToken()` 之后但早于 `escape()` |
 | **delete_link Hook 可 veto 删除** | demo_plugin 示例 | 在删除前执行的 Hook 中调用 `exit()` 可阻止书签被删除（无官方文档说明此能力） |
