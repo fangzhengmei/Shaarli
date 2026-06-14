@@ -315,6 +315,7 @@ $data = hook_C($data, $conf);   // C 接收 B 的结果，再修改
 | `render_feed` | [FeedController.php L49](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/visitor/FeedController.php#L49) | Feed 构建器数组 | feed.rss / atom 模板 |
 | `render_daily` | [DailyController.php L66](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/visitor/DailyController.php#L66) | `['linksToDisplay'=>...]` | daily 模板 |
 | `render_tools` | [ToolsController.php L25](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ToolsController.php#L25) | `['pageabsaddr'=>..., 'sslenabled'=>...]` | tools 模板 |
+| `render_editlink` | [ShaarePublishController.php L57](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaarePublishController.php#L57)（批量）和 [L167](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaarePublishController.php#L167)（单条） | `buildFormData()` 返回的表单数据数组 | editlink 模板（书签编辑表单） |
 
 #### 持久化类 Hook（数据变更阶段）
 
