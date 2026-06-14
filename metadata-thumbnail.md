@@ -384,13 +384,298 @@ GET /admin/metadata?url=http://169.254.169.254/latest/meta-data/
 
 ---
 
-## 8. 总结：关键发现
+## 9. 深度追查：WebThumbnailer 第三方库的实际 HTTP 请求路径
 
-| 领域 | 关键发现 |
-|------|----------|
-| **请求超时** | 仅有总超时（默认 30s），无连接超时；DNS 慢解析可长时间阻塞 |
-| **内容类型** | Header callback 严格过滤 `text/html`，非 HTML 在头部阶段被拒绝；WebThumbnailer 无此限制 |
-| **解析失败** | 静默返回 null，无异常传播，容错性好但难以排查问题 |
-| **提前终止 bug** | download callback 的终止条件依赖未传入的 `$responseCode`/`$contentType` 变量，实际永不触发 |
-| **表单回填** | 异步模式用户体验好；回填仅覆盖空字段，已有内容不被覆盖 |
-| **SSRF 风险** | 无内网 IP 过滤、无 DNS 解析后校验、无频率限制；WebThumbnailer 扩大攻击面 |
+### 9.1 版本与来源
+
+Shaarli 使用的 WebThumbnailer 版本为 `v2.2.0`，来自 [arthurhoaro/web-thumbnailer](https://github.com/ArthurHoaro/web-thumbnailer)（[composer.lock](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/composer.lock#L10-L56)）。
+
+### 9.2 请求架构：双重 HTTP 调用
+
+WebThumbnailer 的缩略图获取流程涉及 **两次独立的 HTTP 请求**，均绕过了 Shaarli 自身 `HttpUtils` 中的 `get_curl_header_callback` 内容类型过滤：
+
+```
+① Finder 查找阶段（DefaultFinder::find()）
+   ├─ 判断 URL 是否为图片扩展名 → 是则直接返回原 URL
+   └─ 否则请求目标页面 HTML → 解析 <meta property="og:image"> 提取缩略图 URL
+
+② 下载阶段（Thumbnailer::thumbnailDownload()）
+   └─ 请求 Finder 返回的缩略图 URL（可能是完全不同的域名/路径）
+     → 下载图片二进制数据 → GD 库裁剪缩放 → 保存到 cache/ 目录
+```
+
+#### 阶段 ①：Finder 查找
+
+[DefaultFinder::find()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Finder/DefaultFinder.php#L35-L83) 中的 WebAccess 调用：
+
+```php
+list($headers, $content) = $this->webAccess->getContent(
+    $this->url,
+    (int) ConfigManager::get('settings.default.timeout', 30),
+    (int) ConfigManager::get('settings.default.max_img_dl', 16777216),  // 16 MiB
+    $callback,
+    $content
+);
+```
+
+- **超时**：默认 30s，可被 Shaarli 的 [web-thumbnailer.json](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/inc/web-thumbnailer.json#L7) 覆盖为 10s
+- **最大下载量**：默认 16 MiB（`max_img_dl`），而非 Shaarli 元数据抓取的 4 MiB——**WebThumbnailer 允许下载 4 倍于元数据抓取的数据量**
+
+#### 阶段 ②：缩略图下载
+
+[Thumbnailer::thumbnailDownload()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Application/Thumbnailer.php#L239-L303) 中的第二次 WebAccess 调用：
+
+```php
+$webaccess = WebAccessFactory::getWebAccess($thumbUrl);
+list($headers, $data) = $webaccess->getContent(
+    $thumbUrl,
+    $this->options[WebThumbnailer::DOWNLOAD_TIMEOUT],
+    $this->options[WebThumbnailer::DOWNLOAD_MAX_SIZE]
+);
+```
+
+- `thumbUrl` 来自 Finder 提取的 `og:image` 或直接图片 URL，**完全由远程页面内容决定**，没有任何域名白名单校验
+- 使用独立的 WebAccess 实例，cURL cookie jar 在两次请求间共享（见下文）
+
+### 9.3 WebAccess 实现与超时/大小控制
+
+#### [WebAccessCUrl](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Application/WebAccess/WebAccessCUrl.php)
+
+核心 cURL 配置（与 Shaarli 自身的 [get_http_response()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/http/HttpUtils.php#L40-L161) 对比）：
+
+| 配置项 | Shaarli HttpUtils | WebThumbnailer WebAccessCUrl |
+|--------|-------------------|------------------------------|
+| `CURLOPT_TIMEOUT` | 30s（可配置） | 30s 默认，JSON 配置可覆盖为 10s |
+| `CURLOPT_MAXREDIRS` | 3 | **6**（重定向链更长） |
+| `CURLOPT_BUFFERSIZE` | 16KB | 16KB |
+| `CURLOPT_COOKIESESSION` | 未设置 | **设置**，配合 `CURLOPT_COOKIEFILE`/`COOKIEJAR` 持久化 cookie |
+| 下载大小限制方式 | PROGRESSFUNCTION + maxBytes | PROGRESSFUNCTION + maxBytes |
+| 默认 maxBytes | 4 MiB | **16 MiB**（`max_img_dl`） |
+| User-Agent | Firefox 115 (Fedora) | Firefox **45** (Linux) + `WebThumbnailer` 标识 |
+| Header callback 内容类型过滤 | ✅ 仅 text/html | ❌ **无全局过滤**，仅在 DefaultFinder 的 WRITEFUNCTION 回调中实现 |
+
+#### [WebAccessPHP](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Application/WebAccess/WebAccessPHP.php)（cURL 不可用时的 fallback）
+
+使用 `file_get_contents()` + PHP stream context：
+- 无内容类型检查
+- 直接读取 `$maxBytes` 字节，使用 `get_headers()` 手动追踪重定向
+- 同样的 `CURLOPT_MAXREDIRS` 等效限制为 3 次
+
+### 9.4 WebThumbnailer 的内容类型过滤策略
+
+WebThumbnailer **没有独立的 Header callback**，它将内容类型判断嵌入到 `CURLOPT_WRITEFUNCTION` 回调中（[DefaultFinder::getCurlCallback()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Finder/DefaultFinder.php#L89-L177)），这带来了关键差异：
+
+```php
+// WRITEFUNCTION 回调中的内容类型分流
+if (
+    !empty($contentType)
+    && strpos($contentType, 'image/') !== false
+    && strpos($contentType, 'application/octet-stream') === false
+) {
+    $thumbnail = $url;  // 直接把原 URL 当作缩略图
+    return false;       // 终止下载
+} elseif (
+    !empty($contentType)
+    && strpos($contentType, 'text/html') === false
+    && strpos($contentType, 'application/octet-stream') === false
+) {
+    return false;       // 非 HTML 非二进制流 → 终止
+}
+```
+
+**关键观察**：
+
+1. **`application/octet-stream` 被当作 HTML 处理继续下载**——二进制流不会被早期终止，可能浪费带宽
+2. **`image/*` 类型被当作缩略图直接返回**——这是 WebThumbnailer 处理直接图片链接的方式
+3. **内容类型过滤仅在 Finder 阶段生效**，在下载阶段（`thumbnailDownload()`）完全没有内容类型检查——恶意 `og:image` 指向非图片资源时，完整内容会被下载并送入 `ImageUtils::generateThumbnail()` 由 GD 库验证
+4. **仅当使用 `WebAccessCUrl` 时才启用回调**——如果 PHP 没装 cURL，`WebAccessPHP` 分支完全不执行 WRITEFUNCTION 回调，**直接下载完整内容后才用 `extractMetaTag()` 解析**，整个响应内容将被载入内存
+
+### 9.5 两次请求间的 Cookie 持久化
+
+```php
+// WebAccessCUrl.php
+$cookie = ConfigManager::get('settings.path.cache') . '/cookie.txt';
+curl_setopt($ch, CURLOPT_COOKIESESSION, true);
+curl_setopt($ch, CURLOPT_COOKIEFILE, $cookie);
+curl_setopt($ch, CURLOPT_COOKIEJAR, $cookie);
+```
+
+- Finder 阶段和缩略图下载阶段共用同一个 `cache/cookie.txt` 文件
+- 这意味着：① 阶段中目标网站设置的 cookie（如登录态、CSRF token）会被 ② 阶段自动携带
+- **跨请求的 cookie 共享可能被利用**：若 Finder 阶段触发目标网站设置某个危险 cookie，下载阶段会带上它请求另一域名的缩略图（虽然存在同源 cookie 限制，但仍需注意）
+
+---
+
+## 10. cURL 协议限制核查：CURLOPT_PROTOCOLS 与 CURLOPT_REDIR_PROTOCOLS
+
+### 10.1 核查结论：两处代码均 **未设置**
+
+| 设置 | Shaarli `get_http_response()` | WebThumbnailer `WebAccessCUrl` |
+|------|-------------------------------|--------------------------------|
+| `CURLOPT_PROTOCOLS` | ❌ 未设置 | ❌ 未设置 |
+| `CURLOPT_REDIR_PROTOCOLS` | ❌ 未设置 | ❌ 未设置 |
+
+### 10.2 未设置的默认行为（PHP 7.1+ / cURL 7.19.4+）
+
+- **`CURLOPT_PROTOCOLS` 默认值**：`CURLPROTO_HTTP | CURLPROTO_HTTPS | CURLPROTO_FTP | CURLPROTO_FTPS`
+- **`CURLOPT_REDIR_PROTOCOLS` 默认值**（自 PHP 7.1.9 / cURL 7.19.4）：`CURLPROTO_HTTP | CURLPROTO_HTTPS | CURLPROTO_FTP | CURLPROTO_FTPS`
+
+这意味着：
+
+1. **FTP 协议被默认允许**——虽然 Shaarli 自身的 `Url::isHttp()` 会在发起请求前拦截非 HTTP(s) scheme，但 `FOLLOWLOCATION` 重定向到 `ftp://` URL 不会被 `isHttp()` 拦截（校验只在初始 URL 做）
+2. **没有被白名单限制为仅 HTTP/HTTPS**——与最佳安全实践不符
+3. **WebThumbnailer 更危险**：其 Finder 阶段和下载阶段均未做 scheme 校验，初始 URL 理论上可以是任何被 cURL 接受的协议
+
+### 10.3 重定向协议风险链
+
+```
+攻击者构造初始 URL: http://evil.com/redirect
+  → evil.com 返回 302 Location: ftp://internal-server/secret.txt
+    → cURL 按默认配置允许 FTP 协议重定向，Shaarli WebThumbnailer 将尝试下载
+```
+
+虽然 FTP 下载最终因 `Content-Type` 不符合或 GD 库无法解析图片而失败，但：
+- **连接已建立**，内网端口/服务可达性可被盲探测
+- 若目标 FTP 服务有匿名登录且提供公开文件，下载字节数可从响应时间推断
+
+### 10.4 与 Shaarli 前端 URL 白名单的差异
+
+书签保存时的 [whitelist_protocols()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/http/UrlUtils.php#L75-L89)：
+
+```php
+function whitelist_protocols($url, $protocols)
+{
+    $protocols = array_merge(['http', 'https'], $protocols);
+    $protocol = preg_match('#^(\w+):/?/?#', $url, $match);
+    if ($protocol === 1 && !in_array($match[1], $protocols)) {
+        $url = str_replace($match[0], 'http://', $url);
+    }
+    return $url;
+}
+```
+
+此函数仅在 `Bookmark::setUrl()` 保存书签时被调用，它替换非白名单协议。但 **缩略图更新时使用的 URL 直接来自 `Bookmark::getUrl()`**，即已通过 `whitelist_protocols` 清洗的 URL——因此 `update-thumbnail` 端点的初始 URL 是相对安全的。然而：
+
+1. `MetadataController::ajaxRetrieveTitle()` 的 URL 来自 `$_GET['url']`，只经过 `get_url_scheme()` 检查，**没有经过 `whitelist_protocols()`**
+2. 重定向过程中 cURL 可能跳转到 FTP 等协议，不受上述白名单保护
+
+---
+
+## 11. update-thumbnail 端点：完整鉴权与 URL 来源链路
+
+### 11.1 路由注册
+
+在 [index.php](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/index.php#L156-L159) 中：
+
+```php
+$this->patch(
+    '/shaare/{id:[0-9]+}/update-thumbnail',
+    '\Shaarli\Front\Controller\Admin\ThumbnailsController:ajaxUpdate'
+);
+// ... 整个 /admin group 都挂载了 ShaarliAdminMiddleware
+})->add('\Shaarli\Front\ShaarliAdminMiddleware');
+```
+
+### 11.2 完整鉴权链路
+
+```
+PATCH /admin/shaare/{id}/update-thumbnail
+  │
+  ├─ ① Slim 路由匹配 → 提取 {id} 为数字正则约束 ([0-9]+)
+  │
+  ├─ ② ShaarliAdminMiddleware
+  │    └─ loginManager->isLoggedIn() === true？
+  │       ├─ false → 302 重定向到 /login
+  │       └─ true → 继续
+  │            └─ 调用 parent: ShaarliMiddleware
+  │                 ├─ 检查是否已安装（配置文件存在）
+  │                 ├─ 执行数据库 updater
+  │                 └─ 检查 open_shaarli 强制登录配置
+  │
+  ├─ ③ ThumbnailsController::ajaxUpdate()
+  │    ├─ {id} 正则约束 + ctype_digit() 双重校验
+  │    ├─ bookmarkService->get((int) $id) 从数据存储读取书签
+  │    │    └─ BookmarkNotFoundException → 404
+  │    ├─ 从已读取的 Bookmark 对象调用 getUrl() 获取 URL
+  │    ├─ 调用 thumbnailer->get($bookmark->getUrl()) 获取缩略图
+  │    ├─ bookmark->setThumbnail($result) 更新内存对象
+  │    └─ bookmarkService->set($bookmark) 写回数据存储
+  │
+  └─ ④ 返回 raw formatter 格式化的书签 JSON
+```
+
+### 11.3 isLoggedIn() 的判定逻辑
+
+[LoginManager::isLoggedIn()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/security/LoginManager.php#L128-L134)：
+
+```php
+public function isLoggedIn(): bool
+{
+    if ($this->openShaarli) {
+        return true;   // ⚠️ 开放 Shaarli 模式下，任何人都算"已登录"
+    }
+    return $this->isLoggedIn;
+}
+```
+
+**重要安全提示**：在 `security.open_shaarli = true` 模式下，**任何匿名用户都被视为已登录**，因此 `update-thumbnail`、`metadata` 等需要管理员权限的端点会暴露给所有人。这是设计特性（公开协作的 Shaarli 实例），但对于部署在可访问内网的服务器，这意味着 SSRF 攻击面也对外开放。
+
+### 11.4 会话校验：checkLoginState()
+
+在 `checkLoginState()` 中，即使 `openShaarli = true` 跳过，正常模式下的校验链为：
+
+1. `staySignedIn` cookie 校验（SHA1 哈希：密码 + IP + salt）
+2. 或 session：`!hasSessionExpired() && !hasClientIpChanged()`
+3. IP 变更检测可通过 `security.session_protection_disabled = true` 关闭
+
+### 11.5 ⚠️ CSRF Token 缺失
+
+与 [ShaarePublishController::save()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaarePublishController.php#L98-L100) 对比：
+
+```php
+// save() 方法有 token 校验
+$this->checkToken($request);
+
+// 但 ThumbnailsController::ajaxUpdate() 中……
+// ❌ 没有 checkToken() 调用！
+```
+
+`ThumbnailsController::ajaxUpdate()` **未调用 `checkToken()`**，即 **不校验 CSRF Token**。同样 `MetadataController::ajaxRetrieveTitle()` 也没有。
+
+这意味着：若用户登录态有效（session cookie 未过期），攻击者可通过第三方页面构造 AJAX PATCH 请求触发缩略图更新——虽然无法读取响应（浏览器 CORS 阻止），但可作为 SSRF 的触发通道，让服务器请求任意已存为书签的 URL。
+
+### 11.6 URL 来源可信度分析
+
+| 端点 | URL 来源 | 是否可信 |
+|------|---------|---------|
+| `update-thumbnail` | `bookmarkService->get($id)->getUrl()` | ✅ **可信**——URL 已存入数据存储，在 `Bookmark::setUrl()` 时已通过 `whitelist_protocols()` 清洗；但仍受重定向 SSRF 影响 |
+| `metadata` | `$request->getParam('url')`（`$_GET`） | ❌ **不可信**——直接来自用户输入，只经过 `get_url_scheme()` 做 `http` 前缀检查 |
+
+**update-thumbnail 的特殊风险**：虽然 URL 本身来自可信存储，但如果攻击者先通过正常流程将恶意 URL（如内网地址 `http://10.0.0.1:6379/`）保存为书签，后续触发 `update-thumbnail` 时仍会发起内网请求。也就是说，**只要 URL 曾被保存成功，就等于通过了所有校验**。
+
+### 11.7 书签 URL 保存路径（如何污染 URL）
+
+攻击者可通过 `POST /admin/shaare` 保存 URL：
+
+1. `ShaarePublishController::save()` → `Bookmark::setUrl($url, $allowedProtocols)`
+2. `Bookmark::setUrl()` → `whitelist_protocols($url, ['http', 'https'] + $allowedProtocols)`
+3. `whitelist_protocols()` 仅**替换协议前缀**为 `http://`，不校验域名/IP
+4. 内网 IP 地址如 `http://10.0.0.1/admin` 完全通过校验——因为协议是合法的 HTTP
+
+**结论**：update-thumbnail 的"可信 URL"仅意味着协议合法，不代表目标 IP/域名安全。SSRF 风险依然存在，只是需要先有一个保存步骤。
+
+---
+
+## 12. 总结：补充关键发现
+
+| 领域 | 新增关键发现 |
+|------|-------------|
+| **WebThumbnailer 架构** | 涉及两次独立 HTTP 调用（Finder 查 og:image + 下载缩略图），均绕过 Shaarli 的内容类型 header callback |
+| **下载大小** | WebThumbnailer Finder 默认允许下载 16 MiB（是元数据抓取的 4 倍），PHP fallback 分支无 WRITEFUNCTION 回调会下载完整内容 |
+| **内容类型过滤** | 仅在 cURL WRITEFUNCTION 回调中实现；PHP fallback 无过滤；`application/octet-stream` 被宽容处理；缩略图下载阶段无内容类型校验 |
+| **cURL 协议限制** | Shaarli 和 WebThumbnailer 均 **未设置** `CURLOPT_PROTOCOLS`/`CURLOPT_REDIR_PROTOCOLS`，默认允许 FTP/FTPS 协议及重定向到 FTP |
+| **Cookie 持久化** | WebThumbnailer 两次请求共享 cookie jar，Finder 阶段设置的 cookie 会被带到下载阶段 |
+| **update-thumbnail 鉴权** | 依赖 `ShaarliAdminMiddleware` + `LoginManager::isLoggedIn()`；open_shaarli 模式下匿名可访问；**CSRF token 校验缺失** |
+| **URL 来源** | update-thumbnail 使用存储中已清洗的 URL（可信），但保存阶段不校验内网 IP，攻击者可预埋恶意 URL；`/metadata` 端点直接接受用户输入的 URL |
+| **SSRF 深层风险** | ① open_shaarli + 未设置 PROTOCOLS → 匿名 FTP 内网探测；② CSRF 缺失 → 登录态下被第三方页面触发；③ 预埋 URL + update-thumbnail → 任意书签 URL 的 SSRF 触发 |
+
