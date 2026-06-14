@@ -373,6 +373,360 @@ if ($visibility === 'all') {
 | 重命名标签 | PUT /api/v1/tags/{tagName} | [Tags::putTag()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/controllers/Tags.php#L113-L140) |
 | 删除标签 | DELETE /api/v1/tags/{tagName} | [Tags::deleteTag()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/controllers/Tags.php#L153-L173) |
 
+## 八、JWT 安全深度分析
+
+### 8.1 签名比对：未使用 hash_equals 存在时序攻击风险
+
+**代码位置**：[ApiUtils::validateJwtToken()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiUtils.php#L31-L34)
+
+```php
+$genSign = Base64Url::encode(hash_hmac('sha512', $parts[0] . '.' . $parts[1], $secret, true));
+if ($parts[2] != $genSign) {
+    throw new ApiAuthorizationException('Invalid JWT signature');
+}
+```
+
+**问题分析**：
+- 使用 `!=` 操作符进行字符串比较，而不是 `hash_equals()`
+- **时序攻击（Timing Attack）风险**：普通字符串比较会在第一个不匹配字符处返回，攻击者可通过测量响应时间差异逐字节推断正确签名
+- 代码库全局搜索 `hash_equals` 无任何匹配，确认未使用时序安全的比较函数
+- 虽然 JWT 签名长度固定（HMAC-SHA512 为 64 字节 Base64Url 编码约 86 字符），但时序攻击在理论上仍可行
+
+### 8.2 alg:none 攻击：未验证 alg 字段存在伪造风险
+
+**代码位置**：[ApiUtils::validateJwtToken()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiUtils.php#L24-L55)
+
+**验证流程分析**：
+1. 检查 token 格式（3 段）
+2. **直接计算签名**：`hash_hmac('sha512', ...)` —— 硬编码使用 HS512
+3. 比对签名
+4. 解析 header（JSON 解码）
+5. 解析 payload（JSON 解码）
+6. 校验签发时间
+
+**问题分析**：
+- Header 中的 `alg` 字段被解析但**从未被验证**
+- 测试用例中 token 固定使用 `"alg": "HS512"`，但代码未强制校验该值
+- **潜在攻击向量**：
+  - `alg:none` 攻击：攻击者构造 `{"alg":"none"}` 的 token，可绕过签名验证
+  - 攻击可行性：由于代码硬编码使用 HMAC-SHA512 重新计算签名，而非根据 header 中的 alg 字段选择算法，因此 `alg:none` 攻击**实际无法生效**
+  - 但这种依赖"巧合安全"的实现不够严谨，应显式校验 alg 字段
+
+**修复建议**：
+```php
+// 解析 header 后应添加 alg 校验
+$header = json_decode(Base64Url::decode($parts[0]));
+if ($header === null || !isset($header->alg) || $header->alg !== 'HS512') {
+    throw new ApiAuthorizationException('Invalid JWT algorithm');
+}
+// 使用 hash_equals 进行安全比较
+if (!hash_equals($parts[2], $genSign)) {
+    throw new ApiAuthorizationException('Invalid JWT signature');
+}
+```
+
+## 九、CORS 安全分析
+
+### 9.1 Allow-Origin: * 配合 Authorization 的安全风险
+
+**代码位置**：[ApiMiddleware::__invoke()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiMiddleware.php#L76-L83)
+
+```php
+return $response
+    ->withHeader('Access-Control-Allow-Origin', '*')
+    ->withHeader(
+        'Access-Control-Allow-Headers',
+        'X-Requested-With, Content-Type, Accept, Origin, Authorization'
+    )
+    ->withHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+```
+
+**问题分析**：
+- `Access-Control-Allow-Origin: *` 表示允许任意域名访问
+- `Access-Control-Allow-Headers` 明确包含 `Authorization`，允许携带认证头
+- **安全风险**：
+  - 根据 W3C CORS 规范，当 `Allow-Origin` 为 `*` 时，浏览器**不应**允许 `withCredentials` 为 `true` 的请求
+  - 但配置本身存在语义冲突：允许跨域 + 允许携带认证头
+  - 如果浏览器实现存在漏洞，可能导致 CSRF 攻击：恶意网站可诱导用户携带 JWT Token 发起跨域请求
+- 更安全的配置应使用白名单域名，并动态设置 `Allow-Origin`
+
+### 9.2 OPTIONS 请求是否经过 ApiMiddleware
+
+**路由配置**：[index.php 第 185-199 行](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/index.php#L185-L199)
+
+```php
+$app->group('/api/v1', function () {
+    $this->get('/info', '\Shaarli\Api\Controllers\Info:getInfo')->setName('getInfo');
+    // ... 其他路由定义
+})->add('\Shaarli\Api\ApiMiddleware');
+```
+
+**Slim 3 框架特性**：
+- Slim 3 内置 `Slim\Middleware\MethodOverrideMiddleware`，但未显式配置
+- Slim 3 对 OPTIONS 请求的处理逻辑：
+  - 若显式定义了 `$app->options()` 路由，则匹配该路由
+  - 若未定义，Slim 的 `Router` 会自动处理匹配路径的 OPTIONS 请求，返回允许的方法列表
+  - **关键点**：group 级别的 middleware 对自动生成的 OPTIONS 响应**同样生效**
+
+**代码追踪结论**：
+- API 组路由中未显式定义 OPTIONS 路由
+- Slim 框架自动生成的 OPTIONS 响应**仍会经过 ApiMiddleware**
+- 流程：
+  1. 浏览器发送 OPTIONS 预检请求到 `/api/v1/links`
+  2. Slim 路由器匹配到 `/api/v1` group
+  3. 执行 ApiMiddleware 中间件
+  4. ApiMiddleware 的 `checkRequest()` 会校验 JWT Token！
+  5. 预检请求通常不携带 Authorization 头 → 抛出 401 错误
+  6. 实际 CORS 预检失败
+
+**这是一个 Bug**：CORS 预检请求（OPTIONS）不应要求认证，浏览器不会在预检请求中携带 Authorization 头。
+
+## 十、is_integer_mixed 函数追踪
+
+**定义位置**：[Utils.php 第 362-369 行](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/Utils.php#L362-L369)
+
+```php
+function is_integer_mixed($input)
+{
+    if (is_array($input) || is_bool($input) || is_object($input)) {
+        return false;
+    }
+    $input = strval($input);
+    return ctype_digit($input) || (startsWith($input, '-') && ctype_digit(substr($input, 1)));
+}
+```
+
+**功能说明**：
+- 检查输入是否为"混合类型整数"，支持字符串数字
+- 排除数组、布尔值、对象类型
+- 支持正整数和负整数字符串
+- 内部使用 `ctype_digit()` 校验
+
+**调用位置**：
+- [Links::getLink()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/controllers/Links.php#L99)
+- [Links::putLink()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/controllers/Links.php#L157)
+- [Links::deleteLink()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/controllers/Links.php#L204)
+
+## 十一、ApiException 掩码逻辑分析
+
+### 11.1 生产环境错误掩码
+
+**核心逻辑**：[ApiAuthorizationException::setMessage()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/exceptions/ApiAuthorizationException.php#L29-L33)
+
+```php
+public function setMessage($message)
+{
+    $original = $this->debug === true ? ': ' . $this->getMessage() : '';
+    $this->message = $message . $original;
+}
+```
+
+**调用流程**：
+1. 代码中抛出异常时设置具体错误消息，如 `throw new ApiAuthorizationException('JWT token not provided')`
+2. 在 `getApiResponse()` 中调用 `$this->setMessage('Not authorized')`
+3. 根据 `debug` 标志决定是否附加原始消息
+
+**掩码效果**：
+
+| debug 模式 | 原始异常消息 | 最终输出 |
+|-----------|-------------|---------|
+| `false`（生产） | `JWT token not provided` | `Not authorized` |
+| `false`（生产） | `Invalid JWT signature` | `Not authorized` |
+| `false`（生产） | `Invalid JWT issued time` | `Not authorized` |
+| `true`（开发） | `JWT token not provided` | `Not authorized: JWT token not provided` |
+
+**安全设计意图**：
+- 防止攻击者通过错误消息枚举系统状态（如区分"token 不存在"和"token 过期"）
+- 避免泄露 JWT 校验的具体实现细节
+
+### 11.2 响应体格式掩码
+
+**代码位置**：[ApiException::getApiResponseBody()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/exceptions/ApiException.php#L39-L48)
+
+```php
+protected function getApiResponseBody()
+{
+    if ($this->debug !== true) {
+        return $this->getMessage();  // 仅返回字符串
+    }
+    return [
+        'message' => $this->getMessage(),
+        'stacktrace' => get_class($this) . ': ' . $this->getTraceAsString()
+    ];
+}
+```
+
+**掩码效果**：
+- 生产环境：简单字符串响应，无结构信息
+- 开发环境：JSON 对象，包含完整消息和堆栈跟踪
+
+## 十二、putTag rename 操作副作用分析
+
+**代码位置**：[Tags::putTag()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/controllers/Tags.php#L113-L140)
+
+### 12.1 执行流程
+
+```
+PUT /api/v1/tags/{tagName}
+    ↓
+1. 检查标签是否存在（bookmarksCountPerTag）
+2. 解析请求体获取新标签名
+3. 搜索所有包含旧标签的书签
+4. 遍历每个书签：
+   ├─ Bookmark::renameTag($from, $to)
+   ├─ BookmarkFileService::set($bookmark, false)  // save=false，暂不写入
+   └─ History::updateLink($bookmark)              // 记录历史
+5. 调用 BookmarkFileService::save()                // 批量写入磁盘
+```
+
+### 12.2 renameTag 内部逻辑
+
+**代码位置**：[Bookmark::renameTag()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/bookmark/Bookmark.php#L513-L522)
+
+```php
+public function renameTag(string $fromTag, string $toTag): void
+{
+    if (($pos = array_search($fromTag, $this->tags ?? [])) !== false) {
+        if (in_array($toTag, $this->tags ?? []) !== false) {
+            $this->deleteTag($fromTag);  // 目标标签已存在 → 合并删除
+        } else {
+            $this->tags[$pos] = trim($toTag);  // 直接替换
+        }
+    }
+}
+```
+
+### 12.3 副作用分析
+
+| 操作 | 副作用 |
+|------|-------|
+| **标签合并** | 若书签同时包含 `fromTag` 和 `toTag`，则仅删除 `fromTag`，`toTag` 保留 |
+| **标签去重** | `trim($toTag)` 会去除新标签名的首尾空白 |
+| **批量更新** | 循环调用 `set($bookmark, false)` 多次更新内存，最后一次 `save()` 写入磁盘，性能较好 |
+| **历史记录** | 每个被修改的书签都会产生一条 updateLink 历史记录 |
+| **缓存失效** | `save()` 会调用 `PageCacheManager::invalidateCaches()` 使所有页面缓存失效 |
+| **时间戳更新** | `BookmarkFileService::set()` 会自动设置 `$bookmark->setUpdated(new DateTime())`，所有受影响书签的 updated 时间被更新为当前时间 |
+| **ID 不变** | 书签 ID 保持不变 |
+
+## 十三、deleteTag 操作完整路径追踪
+
+### 13.1 完整调用链
+
+```
+DELETE /api/v1/tags/{tagName}
+    ↓ 路由解析 [index.php:196](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/index.php#L196)
+    ↓ ApiMiddleware 校验 JWT [ApiMiddleware.php](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiMiddleware.php)
+    ↓ Tags::deleteTag() [Tags.php:153-173](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/controllers/Tags.php#L153-L173)
+        ↓ 1. bookmarksCountPerTag() 检查标签存在
+        ↓ 2. search() 查找所有包含该标签的书签
+        ↓ 3. 循环处理每个书签：
+        │     ↓ Bookmark::deleteTag($tag) [Bookmark.php:539-545](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/bookmark/Bookmark.php#L539-L545)
+        │     ↓ BookmarkFileService::set($bookmark, false) [BookmarkFileService.php:200-217](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/bookmark/BookmarkFileService.php#L200-L217)
+        │     │     ↓ 检查 isLoggedIn 权限
+        │     │     ↓ 检查书签存在
+        │     │     ↓ $bookmark->validate() 校验
+        │     │     ↓ 设置 updated 时间戳
+        │     │     └ 更新内存中的书签数据
+        │     └ History::updateLink($bookmark) 记录历史
+        └ 4. BookmarkFileService::save() [BookmarkFileService.php:309-319](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/bookmark/BookmarkFileService.php#L309-L319)
+              ↓ reorder() 重新排序
+              ↓ BookmarkIO::write() 写入数据文件
+              └ invalidateCaches() 页面缓存失效
+```
+
+### 13.2 deleteTag 内部逻辑
+
+**代码位置**：[Bookmark::deleteTag()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/bookmark/Bookmark.php#L539-L545)
+
+```php
+public function deleteTag(string $tag): void
+{
+    while (($pos = array_search($tag, $this->tags ?? [])) !== false) {
+        unset($this->tags[$pos]);
+        $this->tags = array_values($this->tags);  // 重排索引
+    }
+}
+```
+
+**特点**：
+- 使用 `while` 循环可删除标签数组中所有匹配项（防止重复标签）
+- 删除后调用 `array_values()` 重新索引数组，避免产生稀疏数组
+
+### 13.3 BookmarkFileService::set() 权限检查
+
+**代码位置**：[BookmarkFileService::set()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/bookmark/BookmarkFileService.php#L200-L217)
+
+```php
+public function set(Bookmark $bookmark, bool $save = true): Bookmark
+{
+    if (true !== $this->isLoggedIn) {
+        throw new Exception(t('You\'re not authorized to alter the datastore'));
+    }
+    // ... 后续操作
+}
+```
+
+**关键安全点**：
+- API 场景下 `isLoggedIn=true`（由 ApiMiddleware::setLinkDb() 强制设置）
+- 前端页面场景下由 LoginManager 控制
+- 这是第二层权限校验，防止中间件绕过
+
+## 十四、安全问题总结与修复建议
+
+### 14.1 已识别的安全问题
+
+| 问题 | 严重程度 | 位置 |
+|------|---------|------|
+| 未使用 hash_equals 比对签名 | 中 | [ApiUtils.php:32](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiUtils.php#L32) |
+| 未校验 JWT alg 字段 | 低 | [ApiUtils.php:36-39](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiUtils.php#L36-L39) |
+| CORS Allow-Origin: * + Allow Authorization | 中 | [ApiMiddleware.php:77](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiMiddleware.php#L77) |
+| OPTIONS 预检请求需要 JWT 认证 | 高（可用性） | [ApiMiddleware.php:99](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiMiddleware.php#L99) |
+
+### 14.2 修复建议
+
+**1. 时序攻击防护**：
+```php
+// 使用 hash_equals 替换 !=
+if (!hash_equals($genSign, $parts[2])) {
+    throw new ApiAuthorizationException('Invalid JWT signature');
+}
+```
+
+**2. alg 字段校验**：
+```php
+$header = json_decode(Base64Url::decode($parts[0]));
+if ($header === null || !isset($header->alg) || $header->alg !== 'HS512') {
+    throw new ApiAuthorizationException('Invalid JWT algorithm');
+}
+```
+
+**3. CORS 安全配置**：
+```php
+// 替代方案 1：使用白名单
+$allowedOrigins = ['https://trusted.com'];
+$origin = $request->getHeaderLine('Origin');
+if (in_array($origin, $allowedOrigins)) {
+    $response = $response->withHeader('Access-Control-Allow-Origin', $origin);
+}
+
+// 替代方案 2：若必须允许任意域，禁止携带凭证
+// 移除 Authorization 从 Allow-Headers
+```
+
+**4. OPTIONS 请求跳过鉴权**：
+```php
+protected function checkRequest($request)
+{
+    if (! $this->conf->get('api.enabled', true)) {
+        throw new ApiAuthorizationException('API is disabled');
+    }
+    // OPTIONS 预检请求不需要鉴权
+    if ($request->getMethod() !== 'OPTIONS') {
+        $this->checkToken($request);
+    }
+}
+```
+
 ## 七、总结
 
 Shaarli 的 REST API 设计体现了以下特点：
@@ -382,3 +736,4 @@ Shaarli 的 REST API 设计体现了以下特点：
 3. **权限模型简洁**：API 认证通过即拥有全部权限，私有内容通过 visibility 参数灵活过滤
 4. **错误体系完整**：从 400/401/404/409/500 覆盖主要错误场景，生产环境隐藏敏感错误细节
 5. **CORS 友好**：统一添加跨域头，便于前端集成
+6. **安全改进空间**：JWT 签名比对、alg 字段校验、CORS 配置、OPTIONS 鉴权等方面存在可优化点
