@@ -1250,3 +1250,585 @@ df -h data/
 
 # 5. 单 Tab 登录执行升级（避免并发竞态）
 ```
+
+---
+
+## 十三、锁降级无锁路径：LockAcquireException 降级后双进程并发改写的完整后果
+
+### 13.1 锁降级机制源码解析
+
+[BookmarkIO::synchronized()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkIO.php#L152-L159) 是所有文件 I/O 的互斥保护入口：
+
+```php
+protected function synchronized(callable $function): void
+{
+    try {
+        $this->mutex->synchronized($function);
+    } catch (LockAcquireException $exception) {
+        $function();  // ← 降级：无锁直接执行
+    }
+}
+```
+
+**降级触发条件**（FlockMutex 抛出 LockAcquireException 的场景）：
+
+FlockMutex 构造参数为 `new FlockMutex(fopen(SHAARLI_MUTEX_FILE, 'r'), 2)`（[ContainerBuilder.php#L100](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/container/ContainerBuilder.php#L100)），第二个参数 `2` 是**超时秒数**。LockAcquireException 在以下情况被抛出：
+
+| 场景 | 触发原因 |
+|------|----------|
+| 共享主机 `/tmp` 挂载为 noexec | flock() 系统调用被禁用 |
+| NFS 挂载目录 | flock() 在某些 NFS 配置下不可靠 |
+| 文件描述符耗尽 | `fopen()` 返回 false → flock(null) 异常 |
+| 超时 2 秒仍未获取锁 | 另一进程持锁超过 2 秒 |
+
+降级后，`$function()` 被直接调用，**等同于完全没有并发保护**。
+
+此外，**updates.txt 的读写完全不走 synchronized()**。[UpdaterUtils::writeUpdatesFile()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/updater/UpdaterUtils.php#L33-L43) 直接调用 `file_put_contents()`，没有任何锁保护——无论锁是否正常工作。
+
+### 13.2 降级无锁后双进程并发写 updates.txt 的推演
+
+[ShaarliMiddleware::runUpdates()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/front/ShaarliMiddleware.php#L67-L83) 的执行流程：
+
+```
+进程 A                                   进程 B
+─────────────────────────────────────    ─────────────────────────────────────
+readUpdatesFile() → [M1, M2]
+                                         readUpdatesFile() → [M1, M2]
+update() 执行 M3 → 成功
+                                         update() 执行 M3 → 成功
+writeUpdatesFile([M1, M2, M3])
+                                         writeUpdatesFile([M1, M2, M3])
+```
+
+**竞态窗口 1：writeUpdatesFile 的 file_put_contents 交叉写入**
+
+`file_put_contents()` 在默认模式下**不是原子操作**。它等价于 `fopen → fwrite → fclose`。如果两个进程的 fwrite 交叉执行：
+
+```
+进程 A fwrite("M1;M2;M3")     →  磁盘可能的内容：
+进程 B fwrite("M1;M2;M3")         "M1;M2;M3M1;M2;M3"  ← 交叉拼接
+                                   或
+                                   "M1;M2;M3"          ← 完整覆盖（如果 B 在 A fclose 后才 fopen）
+```
+
+**后果分析**：
+
+| 交叉结果 | 下次 readUpdatesFile 解析 | 后续 update() 行为 |
+|----------|--------------------------|-------------------|
+| `"M1;M2;M3"` | `['M1', 'M2', 'M3']` | 正常，M3 不再执行 |
+| `"M1;M2;M3M1;M2;M3"` | `['M1', 'M2', 'M3M1', 'M2', 'M3']` | `M3M1` 不匹配任何方法名，跳过；`M2`、`M3` 在 doneUpdates 中，M2 被跳过，但**尾部多出的方法名会被忽略**（因为它们是无效方法名，`startsWith('updateMethod')` 检查不通过） |
+| `"M1;M2;M3;M1;M2;M3"` | `['M1', 'M2', 'M3', 'M1', 'M2', 'M3']` | 有重复条目但 in_array 仍能正确匹配，M3 不再执行 |
+| `""`（极端：两进程 fopen 时刻重叠，均 truncate 后只写了部分） | `[]` | **所有方法重新执行**——回到全量重试，靠各方法幂等守卫保护 |
+
+结论：updates.txt 竞态的**最坏后果**是进度记录丢失（文件被截断为空），导致下次请求全量重试。不会导致方法被跳过（因为进度只会丢失不会凭空增加）。
+
+### 13.3 降级无锁后双进程并发写 datastore 的推演
+
+[BookmarkIO::write()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkIO.php#L114-L142) 的关键操作：
+
+```php
+$data = base64_encode(gzdeflate(serialize($links)));  // ← 构造完整字符串
+$data = self::$phpPrefix . $data . self::$phpSuffix;
+$this->synchronized(function () use ($data) {
+    file_put_contents($this->datastore, $data);        // ← 降级后无锁
+});
+```
+
+**降级场景下双进程写推演**：
+
+```
+进程 A                                  进程 B
+──────────────────────────────────      ──────────────────────────────────
+serialize(BookmarkArray_1) → $data_A
+                                        serialize(BookmarkArray_2) → $data_B
+file_put_contents(datastore, $data_A)
+                                        file_put_contents(datastore, $data_B)
+```
+
+PHP 的 `file_put_contents()` 默认使用 `w` 模式（truncate + write），其底层实现：
+
+1. `open(path, O_WRONLY|O_CREAT|O_TRUNC)` → 截断文件
+2. `write(fd, data)` → 写入新内容
+3. `close(fd)` → 关闭
+
+**交叉时序推演**：
+
+```
+时序  进程 A                          进程 B                          datastore 文件内容
+────  ──────────────────────────────  ──────────────────────────────  ─────────────────────
+T1    open(O_TRUNC) → 截断为空                                        (空)
+T2    write($data_A) 开始写入                                         $data_A 前半段
+T3                                     open(O_TRUNC) → 截断为空       (空) ← A 的写入被丢弃
+T4                                     write($data_B) 完成            $data_B 完整
+T5    write($data_A) 继续（fd 仍有效）                                 $data_B + $data_A 残余？
+```
+
+实际上 T3 的 `open(O_TRUNC)` 会独立操作文件 inode，T2 和 T4 的 write 操作的文件偏移量各自独立。最终文件内容取决于**谁最后 close**：
+
+| 最后 close 的进程 | 文件内容 | 可读性 |
+|-------------------|----------|--------|
+| 进程 A | $data_A 完整（进程 A 的 fd 偏移量独立，不受 B 的 truncate 影响） | ✅ 可正常 unserialize |
+| 进程 B | $data_B 完整 | ✅ 可正常 unserialize |
+| 交叉写（极低概率，依赖内核调度） | $data_A 前段 + $data_B 后段（混合内容） | ❌ unserialize 失败 |
+
+**混合内容场景的具体后果**：
+
+1. 下次请求 `BookmarkIO::read()` 执行 `gzinflate(base64_decode(...))` 时：
+   - 如果 base64_decode 得到非法二进制 → `gzinflate()` 返回 false 或抛出 Warning
+   - `unserialize(false)` → 返回 false
+   - `empty(false)` 为 true → 根据 `filesize > 100` 判断：
+     - 文件大（混合后一般仍大于 100 字节）→ 抛出 `NotWritableDataStoreException`
+     - 文件小 → 抛出 `EmptyDataStoreException`
+
+2. **进入 BookmarkFileService 构造函数的 catch 分支**：
+   - `EmptyDataStoreException` → 创建空 BookmarkArray → `$this->save()` → **用空数据覆盖混合文件** → ❗ **数据全部丢失**
+   - `NotWritableDataStoreException` → 不被 catch → 异常冒泡到中间件 → 500 错误页面 → 用户看到错误提示
+
+**关键结论**：锁降级下 datastore 并发写的最坏后果不是"数据混乱"，而是**空数据覆盖导致数据全丢**。因为 `EmptyDataStoreException` 分支会自动用空的 BookmarkArray 执行 save，把已损坏但可恢复的混合文件彻底覆盖为空数据。
+
+### 13.4 降级无锁下升级期间业务写入的竞态
+
+除了双进程同时升级外，另一个危险场景是**一个进程在升级写 datastore，另一个进程在正常业务写 datastore**。
+
+在正常流程中，升级发生在 ShaarliMiddleware（请求早期），业务写入发生在 Controller 中（请求晚期）。但 HTTP 请求是独立的 PHP 进程，两个不同请求的时间线可以完全重叠：
+
+```
+请求 A（升级）：Middleware → update() → BookmarkIO::write(迁移后数据)
+请求 B（业务）：Middleware(已登录，升级已完成) → Controller → addBookmark → BookmarkIO::write(含新书签的数据)
+```
+
+如果锁正常，B 的 write 会等 A 的 write 完成。但降级后：
+
+```
+T0  A: 读取旧格式 datastore（遗留数组）
+T1  B: 读取新格式 datastore（BookmarkArray）— 假设部分已迁移
+T2  A: write(完整迁移后的 BookmarkArray)     ← 不含 B 新增的书签
+T3  B: write(含新增书签的 BookmarkArray)      ← 基于 T1 的快照
+```
+
+结果：B 的写入覆盖 A 的写入。因为 B 的快照更新（包含新增书签），**但 B 可能不包含 A 在迁移中修正的数据**（如 URL 格式修正、sticky 字段补全等）。实际影响取决于迁移方法的具体操作。
+
+### 13.5 锁降级竞态风险总表
+
+| 竞态对象 | 降级后保护 | 最坏后果 | 数据恢复可能性 |
+|----------|------------|----------|----------------|
+| updates.txt | 无保护 | 进度丢失，全量重试（幂等方法安全） | ✅ 可自动恢复 |
+| datastore (双升级进程) | 无保护 | 混合写入 → unserialize 失败 → EmptyDataStoreException → **空数据覆盖** | ❌ **不可恢复**（除非有时间戳备份） |
+| datastore (升级 vs 业务) | 无保护 | 迁移修正数据丢失，仅保留业务快照 | ⚠️ 部分可恢复（丢失的是迁移修正） |
+| config.json.php | 无保护 | 进程 B 用默认值覆盖 A 的真实配置 | ❌ 需从 config.save.php 手动恢复 |
+
+---
+
+## 十四、datastore 缺失或为空时的边界判定全路径
+
+### 14.1 BookmarkFileService 构造函数中的四层分支
+
+位于 [BookmarkFileService.php#L62-L105](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkFileService.php#L62-L105)：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     __construct() 入口                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  条件 1: !isLoggedIn && hide_public_links                          │
+│    → $this->bookmarks = new BookmarkArray()                        │
+│    → 跳过一切读取和迁移                                             │
+│                                                                     │
+│  条件 2: 正常访问（登录/公开可见）                                   │
+│    → bookmarksIO->read()                                           │
+│      │                                                              │
+│      ├─ 正常: 返回 BookmarkArray                                   │
+│      │   → instanceof 检查通过 → 正常流程                          │
+│      │                                                              │
+│      ├─ 正常: 返回 array (遗留格式)                                │
+│      │   → instanceof 检查失败 → migrate() + exit()                │
+│      │                                                              │
+│      ├─ DatastoreNotInitializedException                           │
+│      │   → $this->bookmarks = new BookmarkArray()                  │
+│      │   → isLoggedIn? → initialize() → 写入示例书签               │
+│      │   → !isLoggedIn? → 仅内存空数组，不写入磁盘                  │
+│      │                                                              │
+│      ├─ EmptyDataStoreException                                    │
+│      │   → $this->bookmarks = new BookmarkArray()                  │
+│      │   → isLoggedIn? → save() → 写入空 BookmarkArray 到磁盘     │
+│      │   → !isLoggedIn? → 仅内存空数组                             │
+│      │                                                              │
+│      └─ NotWritableDataStoreException                              │
+│          → 不被 catch → 异常冒泡 → 500 错误页                      │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 14.2 BookmarkIO::read() 异常触发条件精确定义
+
+[BookmarkIO::read()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkIO.php#L75-L104) 的异常判定逻辑：
+
+```php
+public function read()
+{
+    if (! file_exists($this->datastore)) {       // ← 判定 1
+        throw new DatastoreNotInitializedException();
+    }
+
+    if (!is_writable($this->datastore)) {        // ← 判定 2
+        throw new NotWritableDataStoreException($this->datastore);
+    }
+
+    $content = null;
+    $this->synchronized(function () use (&$content) {
+        $content = file_get_contents($this->datastore);
+    });
+
+    $links = unserialize(gzinflate(base64_decode(
+        substr($content, strlen(self::$phpPrefix), -strlen(self::$phpSuffix))
+    )));
+
+    if (empty($links)) {                          // ← 判定 3
+        if (filesize($this->datastore) > 100) {   // ← 判定 4
+            throw new NotWritableDataStoreException($this->datastore);
+        }
+        throw new EmptyDataStoreException();
+    }
+
+    return $links;
+}
+```
+
+**异常判定决策树**：
+
+| 磁盘状态 | file_exists | is_writable | unserialize 结果 | empty? | filesize | 抛出异常 |
+|----------|-------------|-------------|------------------|--------|----------|----------|
+| 文件不存在 | false | — | — | — | — | **DatastoreNotInitializedException** |
+| 文件存在但不可写 | true | false | — | — | — | **NotWritableDataStoreException** |
+| 文件存在，内容为空字符串 | true | true | `unserialize(false)` → false | true | 0 | **EmptyDataStoreException** |
+| 文件存在，仅有 PHP 包裹无内容 | true | true | `unserialize(gzinflate(base64_decode('')))` → false/Warning | true | <100 | **EmptyDataStoreException** |
+| 文件存在，反序列化得到空数组 | true | true | `[]` | true | <100 | **EmptyDataStoreException** |
+| 文件存在，反序列化得到空 BookmarkArray | true | true | `BookmarkArray(count=0)` | **true**（empty 对无属性对象返回 true） | <100 | **EmptyDataStoreException** |
+| 文件存在，反序列化损坏但文件 > 100 字节 | true | true | false 或 PHP Warning | true | >100 | **NotWritableDataStoreException** |
+| 文件存在，正常 BookmarkArray | true | true | BookmarkArray(count>0) | false | — | **正常返回** |
+| 文件存在，正常遗留数组 | true | true | array(count>0) | false | — | **正常返回** |
+
+### 14.3 关键边界场景分析
+
+#### 边界 1：空 BookmarkArray 误判为 EmptyDataStoreException
+
+PHP 的 `empty()` 函数对**任何没有属性的对象**返回 true。`BookmarkArray` 对象在 `count=0` 时，`empty($bookmarkArray)` 返回 true。这意味着：
+
+- 如果用户手动清空了所有书签（通过 Web 界面删除最后一个），save() 写入了一个包含空 BookmarkArray 的 datastore
+- 下次 read() 时，`unserialize()` 返回空 BookmarkArray，`empty()` 判定为 true
+- 抛出 `EmptyDataStoreException`
+- BookmarkFileService 创建**新的空 BookmarkArray** → `save()` 写入
+
+**后果**：功能上无损失（空数据还是空数据），但**空 BookmarkArray 对象被重新创建一次**。如果用户的空 BookmarkArray 有某些特殊属性（理论上不会，因为所有属性在构造函数中初始化），可能丢失。实际影响为零。
+
+#### 边界 2：datastore 不存在 → DatastoreNotInitializedException → initialize()
+
+`DatastoreNotInitializedException` 触发后，BookmarkFileService 调用 `$this->initialize()`，由 [BookmarkInitializer](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkInitializer.php#L39-L114) 创建 3 条示例书签（2 条私有 + 1 条公开），然后 `save()` 写入新格式的 BookmarkArray。
+
+**与 LegacyLinkDB::check() 的关键区别**：
+
+| 对比项 | BookmarkFileService (新) | LegacyLinkDB::check() (旧) |
+|--------|--------------------------|----------------------------|
+| 触发条件 | datastore 文件不存在 | datastore 文件不存在 |
+| 初始内容 | 3 条 Bookmark 对象 | 2 条关联数组 |
+| 存储格式 | BookmarkArray (FORMAT_C) | 遗留数组 (FORMAT_B，含 id/created) |
+| 写入方式 | BookmarkIO::write()（FlockMutex） | FileUtils::writeFlatDB()（无锁） |
+| 读写锁 | 有 synchronized | 无 |
+
+这意味着：如果用户首次安装后直接走新版路径，datastore 一开始就是 FORMAT_C（BookmarkArray），永远不会触发遗留迁移。只有从旧版本升级的用户才会遇到 `instanceof BookmarkArray` 为 false 的情况。
+
+#### 边界 3：datastore 存在但内容被截断 → NotWritableDataStoreException 冒泡
+
+如果 datastore 文件存在但内容被截断（如磁盘满导致写了一半），`unserialize()` 返回 false，且 `filesize > 100`（因为文件包含部分 base64 内容），会抛出 `NotWritableDataStoreException`。
+
+此异常**不被 BookmarkFileService 的 catch 捕获**（catch 仅处理 `EmptyDataStoreException | DatastoreNotInitializedException`），会冒泡到 ShaarliMiddleware → 最终显示 500 错误页。
+
+**这是正确的安全行为**：截断文件不应该被静默覆盖为空数据，而应该让用户知晓并手动从备份恢复。
+
+#### 边界 4：datastore 文件存在但权限不足
+
+`is_writable()` 返回 false → 直接抛出 `NotWritableDataStoreException`，不尝试读取。这是**防御性设计**：如果无法写入，读取后也无法 save()，不如尽早失败。
+
+### 14.4 「缺失/为空」边界是否误触发遗留迁移的判定表
+
+| 磁盘状态 | BookmarkIO::read() 返回 | instanceof BookmarkArray | 走遗留迁移? | 走空初始化? | 实际路径 |
+|----------|------------------------|------------------------|------------|------------|----------|
+| 文件不存在 | DatastoreNotInitializedException | — | ❌ | ✅ initialize() | 新建 3 条示例书签 |
+| 文件为空（0 字节） | EmptyDataStoreException | — | ❌ | ✅ save() 空数组 | 空数据 |
+| 文件仅含 PHP 包裹 | EmptyDataStoreException | — | ❌ | ✅ save() 空数组 | 空数据 |
+| 反序列化得到空 array | EmptyDataStoreException | — | ❌ | ✅ save() 空数组 | 空数据 |
+| 反序列化得到空 BookmarkArray | EmptyDataStoreException | — | ❌ | ✅ save() 空数组 | 空数据 |
+| 反序列化得到非空 array | 原始 array 对象 | **false** | ✅ migrate() | ❌ | 遗留迁移 |
+| 反序列化得到非空 BookmarkArray | BookmarkArray 对象 | **true** | ❌ | ❌ | 正常流程 |
+| 反序列化失败且文件 > 100B | NotWritableDataStoreException | — | ❌ | ❌ | 500 错误页 |
+| 文件不可写 | NotWritableDataStoreException | — | ❌ | ❌ | 500 错误页 |
+
+**核心结论**：只要 datastore 文件存在且内容可解析，`BookmarkIO::read()` 会正常返回反序列化结果。此时**唯一的迁移判定依据是 `instanceof BookmarkArray`**。「缺失」和「为空」两种边界都走**空数据初始化**路径，绝不走遗留迁移——这是正确的，因为遗留迁移的前提是有旧数据需要迁移，空数据无需迁移。
+
+---
+
+## 十五、从破损或截断的时间戳备份回滚引发的二次损坏
+
+### 15.1 备份文件的物理结构
+
+所有 datastore 文件（包括备份）使用相同的物理包装：
+
+```
+<?php /* <base64(gzdeflate(serialize(data)))> */ ?>
+```
+
+由 [FileUtils::writeFlatDB()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/helper/FileUtils.php#L37-L51) 和 [BookmarkIO::write()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkIO.php#L114-L142) 写入。
+
+### 15.2 破损类型与回滚后果
+
+#### 破损类型 A：文件末尾被截断（最常见）
+
+磁盘满时 `file_put_contents()` 可能写了一部分就被中断。文件结构变为：
+
+```
+<?php /* S7QysKquBQA=...（截断，缺少尾部 */ ?>）
+```
+
+回滚操作：`cp datastore.YYYYMMDDHHmmss.php datastore.php`
+
+**二次损坏链**：
+
+```
+1. cp 覆盖 datastore.php 为截断的备份文件
+2. BookmarkIO::read() 执行：
+   $content = file_get_contents(datastore.php)
+   substr($content, strlen('<?php /* '), -strlen(' */ ?>'))
+   ── 当文件末尾缺少 ' */ ?>' 时：
+      - strlen(' */ ?>') = 6
+      - substr 从末尾删 6 字符，但实际内容不足 → 返回更短的字符串或空字符串
+   base64_decode(更短字符串) → 可能得到部分二进制
+   gzinflate(部分二进制) → false 或 PHP Warning
+   unserialize(false) → false
+3. empty(false) === true → filesize(datastore.php) 取决于截断位置：
+   - 大于 100 字节 → NotWritableDataStoreException → 500 错误页
+   - 小于 100 字节 → EmptyDataStoreException → save() 空数据 → ❗ 原始数据被空数据覆盖
+```
+
+**结论**：如果截断的备份文件小于 100 字节，回滚后**不仅无法恢复数据，还会触发空数据初始化流程，把唯一可能通过手动修复的截断文件也覆盖掉**。
+
+#### 破损类型 B：base64 内容中间截断
+
+文件有完整的 PHP 包裹头尾，但中间的 base64 字符串被截断：
+
+```
+<?php /* S7QysKquBQA=...（中间截断）... */ ?>
+```
+
+回滚后的后果链：
+
+```
+1. substr 正常剥离 PHP 包裹头尾
+2. base64_decode(截断的 base64) → 得到不完整二进制（PHP 会忽略无效尾部）
+3. gzinflate(不完整二进制) → false 或 PHP Warning
+4. unserialize(false) → false
+5. empty(false) === true
+6. filesize > 100 → NotWritableDataStoreException → 500 错误页
+```
+
+这种情况下系统**不会自动覆盖数据**，因为 `filesize > 100` 触发的是 `NotWritableDataStoreException`，冒泡为 500 错误。用户仍可手动修复。
+
+#### 破损类型 C：文件内容全部为零/空格
+
+某些文件系统错误可能导致文件被填零：
+
+```
+<?php /* AAAAAAAAAAAAAA... */ ?>  （base64 的全零编码）
+```
+
+后果链：
+
+```
+1. substr 剥离 PHP 包裹
+2. base64_decode → 二进制全零
+3. gzinflate(全零) → false
+4. unserialize(false) → false
+5. empty(true) + filesize 取决于填充量 → 通常是 NotWritableDataStoreException
+```
+
+不会触发空数据覆盖，但数据已不可恢复。
+
+#### 破损类型 D：序列化对象版本不兼容
+
+备份文件完整可读，但 `serialize()` 的对象定义与当前代码不兼容（如类名变更、属性删除）。这种情况在跨主版本备份中更常见，详见第十六章。
+
+### 15.3 回滚前的安全校验步骤
+
+在执行 `cp backup datastore.php` 之前，应先验证备份文件的完整性：
+
+```bash
+# 步骤 1：检查文件大小
+ls -la data/datastore.YYYYMMDDHHmmss.php
+# 如果文件 < 50 字节，几乎可以确定是空的或损坏的
+
+# 步骤 2：验证 PHP 包裹完整性
+head -c 9 data/datastore.YYYYMMDDHHmmss.php | xxd
+# 期望输出: 3c3f706870202f2a20  (<?php /* )
+
+tail -c 7 data/datastore.YYYYMMDDHHmmss.php | xxd
+# 期望输出: 202a2f203f3e0a     ( */ ?>\n)
+
+# 步骤 3：验证反序列化
+php -r '
+  $file = "data/datastore.YYYYMMDDHHmmss.php";
+  $content = file_get_contents($file);
+  if (strlen($content) < 20) { echo "ERROR: file too short\n"; exit(1); }
+  $prefix = "<?php /* ";
+  $suffix = " */ ?>";
+  $payload = substr($content, strlen($prefix), -strlen($suffix));
+  $binary = @base64_decode($payload, true);
+  if ($binary === false) { echo "ERROR: base64 decode failed\n"; exit(1); }
+  $inflated = @gzinflate($binary);
+  if ($inflated === false) { echo "ERROR: gzinflate failed\n"; exit(1); }
+  $data = @unserialize($inflated);
+  if ($data === false) { echo "ERROR: unserialize failed\n"; exit(1); }
+  $type = gettype($data);
+  if ($type === "object") $type = get_class($data);
+  echo "OK: type=$type, count=" . (is_countable($data) ? count($data) : "N/A") . "\n";
+'
+# 期望输出: OK: type=Shaarli\Bookmark\BookmarkArray, count=XXX
+#    或:    OK: type=array, count=XXX
+
+# 步骤 4：仅在步骤 3 通过后才执行回滚
+cp data/datastore.YYYYMMDDHHmmss.php data/datastore.php
+```
+
+### 15.4 破损备份回滚二次损坏风险总表
+
+| 破损类型 | 自动后果 | 是否触发空数据覆盖 | 手动可恢复性 |
+|----------|----------|-------------------|-------------|
+| 尾部截断（文件 < 100B） | EmptyDataStoreException → save() 空数据 | ❗ **是** | ❌ **不可恢复** |
+| 尾部截断（文件 > 100B） | NotWritableDataStoreException → 500 | 否 | ⚠️ 可能可部分修复（base64 截断前的数据） |
+| 中间截断（有完整包裹） | NotWritableDataStoreException → 500 | 否 | ❌ 不可恢复（gzinflate 要求完整输入） |
+| 全零/乱码填充 | NotWritableDataStoreException → 500 | 否 | ❌ 不可恢复 |
+| 完整但版本不兼容 | unserialize 异常或对象不完整 | 否（大概率 > 100B → NotWritable） | ⚠️ 取决于版本差异 |
+
+---
+
+## 十六、跨主版本备份兼容性判断
+
+### 16.1 数据格式的版本演进与兼容性
+
+Shaarli 的数据文件通过 `serialize()` 持久化，PHP 的序列化格式天然绑定**类名和属性结构**。跨主版本恢复备份时，核心风险在于序列化对象定义的变更。
+
+| 版本区间 | 数据格式 | 类名/结构变更 | 恢复兼容性 |
+|----------|----------|--------------|------------|
+| v0.5 → v0.8 | FORMAT_A (日期主键数组) | 无类名，纯关联数组 | ✅ 完全兼容（LegacyLinkDB 可读） |
+| v0.8 → v0.9 | FORMAT_B (整数主键数组) | 无类名，纯关联数组 | ✅ 完全兼容（LegacyLinkDB 可读） |
+| v0.9 → v0.12 | FORMAT_B → FORMAT_C | `array` → `BookmarkArray` + `Bookmark` | ⚠️ 需经过迁移链 |
+| v0.12 → v0.13+ | FORMAT_C (BookmarkArray) | Bookmark 属性可能增减 | ⚠️ 取决于具体变更 |
+
+### 16.2 PHP 序列化的前向/后向兼容规则
+
+PHP `unserialize()` 对对象的处理：
+
+| 场景 | unserialize 行为 | 后果 |
+|------|-----------------|------|
+| 类存在，属性增加 | 新属性取默认值 | ✅ 安全 |
+| 类存在，属性删除 | `__unserialize` 忽略多余属性（如果有自定义逻辑）；否则触发 `Undefined property` Notice | ⚠️ 可能丢失数据 |
+| 类不存在 | 创建 `__PHP_Incomplete_Class` 对象 | ❌ 不可用，后续 `instanceof` 检查全失败 |
+| 类重命名 | 等同于类不存在 | ❌ 同上 |
+| 属性重命名 | 旧属性名值丢失，新属性取默认值 | ⚠️ 数据丢失 |
+
+### 16.3 Bookmark 类的属性变更历史
+
+Bookmark 对象在不同版本间属性逐步增加：
+
+| 属性 | 引入版本 | 默认值 | 恢复旧备份时行为 |
+|------|----------|--------|-----------------|
+| `id` | v0.9 | null | 始终存在 |
+| `shortUrl` | v0.9 | '' | 始终存在 |
+| `url` | v0.9 | '' | 始终存在 |
+| `title` | v0.9 | '' | 始终存在 |
+| `description` | v0.9 | '' | 始终存在 |
+| `tags` | v0.9 | [] | 始终存在 |
+| `thumbnail` | v0.9 | '' | 始终存在 |
+| `sticky` | v0.12 | false | 旧备份无此属性 → unserialize 后 `Undefined property` Notice → **不会导致 fatal 错误** |
+| `created` | v0.9 | null | 始终存在 |
+| `updated` | v0.9 | null | 始终存在 |
+| `private` | v0.9 | false | 始终存在 |
+| `additionalContent` | 后期 | [] | 旧备份无此属性 → Notice |
+
+**结论**：由于属性**只增不删**，用旧版本的 BookmarkArray 备份恢复到新版本时，缺失的属性会被 PHP 自动忽略（触发 Notice 但不致命），新代码访问这些属性时使用默认值。功能上不会崩溃，但**缺失的属性值会回退为默认值**（如 sticky 全变 false、thumbnail 全变空）。
+
+### 16.4 跨版本恢复的完整兼容性矩阵
+
+| 备份格式 → 恢复目标 | FORMAT_A 备份 | FORMAT_B 备份 | FORMAT_C (旧) 备份 | FORMAT_C (新) 备份 |
+|---------------------|--------------|--------------|-------------------|-------------------|
+| **FORMAT_A 环境** | ✅ 直接可用 | ❌ ID 不兼容 | ❌ 类不存在 | ❌ 类不存在 |
+| **FORMAT_B 环境** | ✅ LegacyLinkDB 兼容 | ✅ 直接可用 | ❌ 类不存在 | ❌ 类不存在 |
+| **FORMAT_C (旧) 环境** | ⚠️ 需迁移 | ⚠️ 需迁移 | ✅ 直接可用 | ⚠️ 新属性缺失 |
+| **FORMAT_C (新) 环境** | ⚠️ 需迁移 | ⚠️ 需迁移 | ✅ 属性默认值填充 | ✅ 直接可用 |
+
+### 16.5 跨版本恢复操作步骤
+
+#### 场景 A：FORMAT_A/B 备份恢复到 FORMAT_C 环境
+
+```
+步骤 1：验证备份完整性（见 15.3 的校验步骤）
+
+步骤 2：确认备份格式类型
+        php -r '
+          // ... 读取并反序列化 ...
+          $type = gettype($data);
+          if ($type === "object") $type = get_class($data);
+          echo $type . "\n";
+        '
+        # 输出 "array" → FORMAT_A 或 FORMAT_B
+
+步骤 3：用备份覆盖 datastore.php
+        cp data/datastore.YYYYMMDDHHmmss.php data/datastore.php
+
+步骤 4：删除 updates.txt 中相关的迁移记录
+        # 删掉 updateMethodDatastoreIds 和 updateMethodMigrateDatabase
+        # 或者直接删除整个 updates.txt 触发完整重跑
+        rm -f data/updates.txt
+
+步骤 5：浏览器登录 Shaarli
+        - BookmarkFileService 检测到 array（非 BookmarkArray）→ 触发 migrate()
+        - LegacyUpdater 自动执行所有未记录的迁移方法
+        - 包括 DatastoreIds + MigrateDatabase → 自动完成格式转换
+
+步骤 6：验证书签数量和内容完整性
+```
+
+#### 场景 B：FORMAT_C 旧版备份恢复到新版 FORMAT_C 环境
+
+```
+步骤 1：验证备份完整性
+
+步骤 2：直接覆盖
+        cp data/datastore.YYYYMMDDHHmmss_1.php data/datastore.php
+
+步骤 3：无需删除 updates.txt
+        - BookmarkFileService 检测到 BookmarkArray（旧版）→ instanceof 通过
+        - 但某些新属性缺失 → 代码中访问时触发 Notice
+        - 不影响核心功能，只是缺失属性使用默认值
+
+步骤 4（可选）：重新运行属性补全升级方法
+        # 删除 updates.txt 中对应方法的记录，触发重跑
+        # 例如删掉 updateMethodSetSticky 让它重新为所有书签添加 sticky=false
+```
+
+#### 场景 C：FORMAT_C 备份恢复到 FORMAT_B 环境（版本降级）
+
+**不推荐，且无法自动完成**。需要：
+
+```
+1. 在新版环境中导出为 Netscape Bookmark HTML 格式（Tools → Export）
+2. 在旧版环境中导入
+3. 或手动编写转换脚本将 BookmarkArray → 关联数组
+```
+
+### 16.6 备份兼容性的设计缺陷与改进建议
+
+| 当前设计 | 问题 | 改进建议 |
+|----------|------|----------|
+| 使用 PHP serialize() | 绑定类定义，跨版本不兼容 | 改用 JSON 或版本化的序列化格式 |
+| 无版本标记 | 无法判断备份来自哪个版本 | 在 datastore 头部写入版本号 |
+| 属性只增不删但无迁移映射 | 旧备份恢复后缺失属性无补偿 | 在 Bookmark::__unserialize() 中补全默认值 |
+| 备份文件名不含格式标记 | 无法从文件名判断 FORMAT_A/B/C | 命名中加入格式标识，如 `datastore.v2.YYYYMMDDHHmmss.php` |
