@@ -727,6 +727,174 @@ class DemoPluginController extends ShaarliAdminController
 | **错误数组 array_merge 累积** | `$this->errors = array_unique(array_merge($this->errors, $errors))`，若某插件 init 返回非数组（如字符串），`array_merge` 会产生 Warning，被错误报告设置吞掉；若 `$this->errors` 尚未初始化（PHP 7.4+ 下访问未声明属性会产生 Warning），也会导致错误累积失效 |
 | **多插件相同 _init 副作用冲突** | 插件 A `_init()` 调用 `$conf->set('translation.extensions.foo', 'xxx')` 后 `$conf->write(true)`；插件 B 同样 `set('translation.extensions.foo', 'yyy')` 再 write → 插件 B 覆盖 A；如果 A 还读取了自己写入的值（如注册语言域），会读到 B 写入的内容 |
 
+### 7.5 _init 阶段配置写入的原子性与并发竞态
+
+#### 7.5.1 完整调用链与非原子写入路径
+
+插件在 `_init()` 中修改配置并持久化的完整调用链路：
+
+```
+malicious_plugin_init($conf)
+  → $conf->set('credentials.hash', password_hash('attacker_pwd', PASSWORD_DEFAULT))
+  → $conf->write(true)
+    ├─ [ConfigManager::write](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/config/ConfigManager.php#L214-L241)
+    │   ├─ 校验 $isLoggedIn === true（插件自行传入，无真实鉴权）
+    │   ├─ 校验 mandatoryFields（credentials.hash 等 9 个字段必须存在）
+    │   └─ $this->configIO->write($this->getConfigFileExt(), $this->loadedConfig)
+    │       ├─ [ConfigPhp::write](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/config/ConfigPhp.php#L97-L135) （默认）
+    │       │   ├─ 拼接 $configStr = '<?php ' + var_export(全部配置)
+    │       │   ├─ ❌ file_put_contents($filepath, $configStr)  [L126] —— 无 LOCK_EX，无临时文件+rename
+    │       │   └─ 读取文件验证内容（strcmp 比较，仅验证完整性，不验证并发）
+    │       └─ [ConfigJson::write](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/config/ConfigJson.php#L44-L56) （可选）
+    │           ├─ 拼接 $data = PHP headers + json_encode($conf) + PHP suffix
+    │           └─ ❌ file_put_contents($filepath, $data)  [L49] —— 同样无 LOCK_EX
+    └─ 返回 true / 抛 IOException
+```
+
+两个 ConfigIO 实现的 `file_put_contents` 调用都存在相同问题：
+
+| 配置类型 | 代码位置 | 问题 |
+|---------|----------|------|
+| PHP 配置（默认） | [ConfigPhp.php L126](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/config/ConfigPhp.php#L126) | `!file_put_contents($filepath, $configStr)` — 无 `LOCK_EX` 独占锁 |
+| JSON 配置（可选） | [ConfigJson.php L49](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/config/ConfigJson.php#L49) | `!file_put_contents($filepath, $data)` — 无 `LOCK_EX` 独占锁 |
+
+#### 7.5.2 原子性问题详解
+
+**非原子写入的三个核心问题**：
+
+1. **缺少 `LOCK_EX` 独占锁**：
+   - `file_put_contents` 的第 3 参数 flags 未传入 `LOCK_EX`
+   - 两个 PHP-FPM 进程可以同时向同一文件写入，后写者覆盖先写者
+   - 写入过程中另一进程可读取到**部分写入**的无效 PHP 代码
+
+2. **未使用"临时文件 + rename"原子替换模式**：
+   - 正确模式：`file_put_contents($tmpFile, $data)` → `rename($tmpFile, $targetFile)`
+   - `rename()` 在同一文件系统上是原子操作，读进程要么看到旧文件要么看到完整新文件
+   - 当前代码直接写入目标文件，写入过程中断（磁盘满、进程 kill、超时）会留下**半写文件**
+
+3. **读-改-写无事务保护**：
+   - `$conf->set()` 修改内存中的 `loadedConfig` 数组
+   - `$conf->write()` 将**全部配置**序列化写入（不是增量更新）
+   - 在 set 与 write 之间，另一进程可能已修改配置并完成写入
+   - 当前进程 write 时会**覆盖**对方的修改（丢失更新）
+
+#### 7.5.3 配置文件半写的严重后果
+
+[ConfigManager::load()](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/config/ConfigManager.php#L120-L162) 中包含这样的错误处理：
+
+```php
+try {
+    $conf = $this->configIO->read($this->getConfigFileExt());
+} catch (\Exception $e) {
+    die($e->getMessage());
+}
+```
+
+- `ConfigPhp::read()` 使用 `include $filepath` 载入配置文件
+- 若配置文件因半写导致 PHP 语法错误（如 `$GLOBALS['config']['` 不完整）
+- `include` 触发 `ParseError` / `Fatal error` → 整个 PHP 进程崩溃
+- 在 PHP-FPM 模式下，**每个请求都会尝试载入配置**，导致站点完全不可用（白屏 500）
+- 恢复方法：手动删除损坏的配置文件或从备份恢复
+
+#### 7.5.4 FastCGI 多进程环境下的并发漏洞
+
+PHP FastCGI（PHP-FPM）典型配置下，多个工作进程同时处理请求，每个进程独立执行完整的插件加载流程。以下是管理员改密码后被恶意插件覆盖的两种场景：
+
+**场景一：串行覆盖（无需并发，每次请求执行 _init）**
+
+```
+时间   进程 A（管理员操作）              进程 B（用户访问任意页面）
+───   ────────────────────              ──────────────────────
+ T1   管理员登录 → 修改密码
+ T2   ConfigController 执行:
+      $conf->set('credentials.hash', password_hash('admin_new_pwd'))
+      $conf->write(true)
+      → 写入配置文件: hash = admin_new_pwd ✅
+ T3                                       匿名用户访问首页
+                                          index.php → PluginManager::load()
+                                          → 执行 malicious_plugin_init()
+                                          → $conf->set('credentials.hash', password_hash('attacker_pwd'))
+                                          → $conf->write(true)
+                                          → 写入配置文件: hash = attacker_pwd ❌
+ T4   管理员下次请求时，配置已被覆盖为攻击者密码
+ T5   管理员再次改密码 → T3 再次发生 → 无限循环
+```
+
+关键：`_init()` 在**每个请求的加载阶段**都执行（[PluginManager.php L176-L183](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/plugin/PluginManager.php#L176-L183)），无需并发，只要有任何请求触发 _init，就能覆盖管理员密码。
+
+**场景二：并发竞态（两个进程同时 write）**
+
+```
+时间   进程 A（管理员改密码）            进程 B（恶意插件 _init）
+───   ────────────────────              ──────────────────────
+ T1   $conf->set('hash', 'admin_new')
+ T2                                       $conf->set('hash', 'attacker')
+ T3   $conf->write() 开始:
+      file_put_contents 写入 100KB 配置
+      已写入前 50KB...
+ T4                                       $conf->write() 开始:
+                                          file_put_contents 也向同一文件写入
+                                          （无 LOCK_EX，不会阻塞）
+ T5   进程 A 完成写入，文件内容 = 进程 A 的前 50KB + 进程 B 的全部内容
+      → 文件内容损坏，PHP 语法错误
+ T6   下一个请求 include 该文件时 die() → 整个站点崩溃
+```
+
+**场景三：丢失更新（读-改-写竞态）**
+
+```
+时间   进程 A（管理员改站点标题）        进程 B（恶意插件改密码）
+───   ────────────────────              ──────────────────────
+ T1   读配置: loadedConfig = [
+        'general.title' => 'Old Title',
+        'credentials.hash' => 'admin_hash'
+      ]
+ T2                                       读配置: 相同内容
+ T3   set('general.title', 'New Title')
+ T4                                       set('credentials.hash', 'attacker_hash')
+ T5   write() → 写入文件:
+        title='New Title', hash='admin_hash'
+        （进程 A 的内存中 hash 仍是旧值）
+ T6                                       write() → 写入文件:
+                                          title='Old Title', hash='attacker_hash'
+                                          （进程 B 的内存中 title 仍是旧值）
+ T7   最终文件: title='Old Title'（管理员的修改丢失）, hash='attacker_hash'
+```
+
+后果：管理员修改站点标题后，不仅标题恢复原状，密码还被悄悄替换了。
+
+#### 7.5.5 $isLoggedIn 参数的虚假保护
+
+[ConfigManager::write() L229-L231](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/config/ConfigManager.php#L229-L231) 的登录检查：
+
+```php
+if (is_file($this->getConfigFileExt()) && !$isLoggedIn) {
+    throw new UnauthorizedConfigException();
+}
+```
+
+- 检查的是**调用者传入的 `$isLoggedIn` 参数**，不是当前请求的真实登录状态
+- 插件可以任意传入 `true`：`$conf->write(true)`（如 [demo_plugin.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/plugins/demo_plugin/demo_plugin.php) 中就是硬编码 `true`）
+- 即使插件传入 `false`，只要配置文件**尚不存在**（首次安装场景），`is_file()` 为 false，检查也会跳过
+- 结论：该检查对插件完全无效，形同虚设
+
+#### 7.5.6 并发竞态矩阵汇总
+
+| 场景 | 触发条件 | 竞态类型 | 后果 | 可利用性 |
+|------|----------|---------|------|---------|
+| **串行密码覆盖** | 恶意插件 _init 中 set(hash)+write | 无需并发 | 管理员密码每次请求后被重置 | 🔴 极易 |
+| **并发半写崩溃** | 两个进程同时 write | 非原子写入 | 配置文件语法错误 → 站点全挂 | 🟠 中等（需 timing） |
+| **丢失更新** | 两个并发请求都修改配置 | 读-改-写竞态 | 一方修改被覆盖，另一方修改成功 | 🟡 较低（需同时修改） |
+| **部分读入不一致** | 一个进程 write 中途，另一个进程 read | 无文件锁 | read 到半写文件 → 解析失败 → 崩溃 | 🟠 中等 |
+
+#### 7.5.7 为什么插件作者可以轻易利用
+
+1. 官方 demo_plugin 明确展示了 `$conf->write(true)` 用法，插件作者可直接复制
+2. `credentials.hash` 字段是 mandatory 校验字段之一，插件只要确保 `set` 时不删除它就能通过校验
+3. `_init()` 每次请求执行，无需等待管理员交互
+4. 配置写入无审计日志，管理员无法发现密码哈希何时被修改
+5. 管理员改密码操作也是通过同样的 `ConfigManager::write()` 路径，与插件写入无优先级差异
+
 ---
 
 ## 八、核心文件索引
@@ -745,7 +913,12 @@ class DemoPluginController extends ShaarliAdminController
 | [ShaarliAdminController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaarliAdminController.php) | 管理员控制器基类（继承不等于自动鉴权） |
 | [ShaareManageController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaareManageController.php) | save_link / delete_link Hook 触发点 |
 | [BookmarkFilter.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/bookmark/BookmarkFilter.php) | filter_search_entry 4 处调用点（均无 try-catch） |
-| [PluginInvalidRouteException.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/plugin/exception/PluginInvalidRouteException.php) | 路由校验异常类（构造函数忽略插件名，硬编码消息） |
-| [demo_plugin.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/plugins/demo_plugin/demo_plugin.php) | 官方演示插件（展示了 exit、save_plugin_parameters、路由注册等所有用法） |
+| [ConfigIO.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/config/ConfigIO.php) | 配置读写接口（两个实现都缺少 LOCK_EX） |
+| [ConfigPhp.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/config/ConfigPhp.php) | PHP 配置文件写入实现（file_put_contents 无 LOCK_EX，非原子写入） |
+| [ConfigJson.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/config/ConfigJson.php) | JSON 配置文件写入实现（同样缺少 LOCK_EX） |
+| [BookmarkRawFormatter.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/formatter/BookmarkRawFormatter.php) | raw 格式化器（无任何转义，类文档警告 XSS 风险） |
+| [ShaarePublishController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/front/controller/admin/ShaarePublishController.php) | 书签发布/编辑控制器（save_link / render_editlink Hook 触发点） |
+| [PluginInvalidRouteException.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/application/plugin/exception/PluginInvalidRouteException.php) | 路由校验异常类（构造器无参数声明 vs throw 传参的语义不一致） |
+| [demo_plugin.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/plugins/demo_plugin/demo_plugin.php) | 官方演示插件（展示了 exit、save_plugin_parameters、$conf->write(true) 等所有用法） |
 | [DemoPluginController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/plugins/demo_plugin/DemoPluginController.php) | 演示插件自定义控制器（继承 ShaarliAdminController 但不自动鉴权） |
 | [PluginManagerTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/75-Shaarli/tests/PluginManagerTest.php) | 插件系统单元测试（覆盖错误累积、路由异常、元数据解析等） |
