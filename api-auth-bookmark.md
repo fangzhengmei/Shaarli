@@ -457,38 +457,124 @@ if ($parts[2] != $genSign) {
 - 代码库全局搜索 `hash_equals` 无任何匹配，确认未使用时序安全的比较函数
 - 虽然 JWT 签名长度固定（HMAC-SHA512 为 64 字节 Base64Url 编码约 86 字符），但时序攻击在理论上仍可行
 
-### 8.2 alg:none 攻击：未验证 alg 字段存在伪造风险
+### 8.2 alg:none 可达性结论：不可达
 
 **代码位置**：[ApiUtils::validateJwtToken()](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiUtils.php#L24-L55)
 
-**验证流程分析**：
-1. 检查 token 格式（3 段）
-2. **直接计算签名**：`hash_hmac('sha512', ...)` —— 硬编码使用 HS512
-3. 比对签名
-4. 解析 header（JSON 解码）
-5. 解析 payload（JSON 解码）
-6. 校验签发时间
+**完整验证流程**（严格按代码执行顺序）：
+```
+步骤 1: 拆分 JWT 为 3 段 → 非 3 段则 "Malformed JWT token"
+步骤 2: 固定算法重算签名
+        $genSign = Base64Url::encode(hash_hmac('sha512', $parts[0] . '.' . $parts[1], $secret, true))
+步骤 3: 签名比对 if ($parts[2] != $genSign) → 不等则 "Invalid JWT signature"
+步骤 4: Base64Url::decode($parts[0]) 然后 json_decode → 失败则 "Invalid JWT header"
+步骤 5: Base64Url::decode($parts[1]) 然后 json_decode → 失败则 "Invalid JWT payload"
+步骤 6: 检查 iat 存在且有效 → "Invalid JWT issued time"
+```
 
-**问题分析**：
-- Header 中的 `alg` 字段被解析但**从未被验证**
-- 测试用例中 token 固定使用 `"alg": "HS512"`，但代码未强制校验该值
-- **潜在攻击向量**：
-  - `alg:none` 攻击：攻击者构造 `{"alg":"none"}` 的 token，可绕过签名验证
-  - 攻击可行性：由于代码硬编码使用 HMAC-SHA512 重新计算签名，而非根据 header 中的 alg 字段选择算法，因此 `alg:none` 攻击**实际无法生效**
-  - 但这种依赖"巧合安全"的实现不够严谨，应显式校验 alg 字段
+**可达性分析**：
 
-**修复建议**：
+构造攻击 token：`{"alg":"none"}.{"iat":<valid>}.<empty_or_any>`
+
+追踪执行：
+1. 步骤 2 硬编码调用 `hash_hmac('sha512', header_b64.payload_b64, $secret, true)` — 无论 header 中写什么算法，这里始终以 HS512 重新计算
+2. 攻击者无法用 `alg:none` 的空签名匹配 HS512 输出（除非猜到 `$secret`）
+3. 因此在**步骤 3 必然抛出 `Invalid JWT signature`**，永远到不了步骤 4 解析 alg 字段
+
+**结论：alg:none 不可达。** 这不是巧合安全，而是"先签名再解析"的顺序 + 硬编码算法的双重保障。代码在 header 被解析之前就已经用固定算法 HS512 重算了签名并比对。
+
+**仍建议显式校验 alg 的理由（防御性编程）**：
+- 即使当前不可达，未来若有人重构将步骤 4、5 提前到步骤 2 之前，或改为从 alg 动态分派算法，就会引入漏洞
+- 遵循 JWT 安全最佳实践，显式校验是更严谨的做法
+
+**修复建议**（定位为防御性编程，而非修复实际漏洞）：
 ```php
-// 解析 header 后应添加 alg 校验
+// 在签名比对成功后追加 alg 校验（防未来回归）
 $header = json_decode(Base64Url::decode($parts[0]));
 if ($header === null || !isset($header->alg) || $header->alg !== 'HS512') {
     throw new ApiAuthorizationException('Invalid JWT algorithm');
 }
-// 使用 hash_equals 进行安全比较
-if (!hash_equals($parts[2], $genSign)) {
-    throw new ApiAuthorizationException('Invalid JWT signature');
+```
+
+### 8.3 JWT Replay 链路分析：9 分钟窗口缺 jti 一次性消耗
+
+**代码事实**：
+- 全局搜索 `jti|JTI` 无任何匹配，代码库从未使用 `jti`（JWT ID）claim
+- Token 有效期固定 9 分钟（[ApiMiddleware::$TOKEN_DURATION = 540](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiMiddleware.php#L25)）
+- `iat` 校验仅做时间窗口判断，不做任何一次性消耗记录
+
+**iat 校验代码**：[ApiUtils::validateJwtToken() L43-L54](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/application/api/ApiUtils.php#L43-L54)
+```php
+if (empty($payload->iat) || $payload->iat > time()) {
+    throw new ApiAuthorizationException('Invalid JWT issued time');
+}
+if (time() - $payload->iat > ApiMiddleware::$TOKEN_DURATION) {
+    throw new ApiAuthorizationException('Invalid JWT issued time');
 }
 ```
+
+**完整 Replay 链路追踪**：
+
+```
+攻击前提：攻击者已截获一个合法 JWT 请求（中间人/HTTPS 降级/日志泄露/Referer 泄漏）
+
+链路 1: 写操作重放
+  T=0s    合法用户: POST /api/v1/links  Authorization: Bearer <token> (iat=T0)
+          → ApiMiddleware::checkRequest() → checkToken() → validateJwtToken() 通过
+          → Links::postLink() → ApiUtils::buildBookmarkFromRequest() → BookmarkFileService::add()
+          → BookmarkFileService::save() → 写入磁盘 → 返回 201 + Location
+
+  T=300s  攻击者: 重放同一请求（相同 Authorization 头）
+          → validateJwtToken(): time()-iat = 300 < 540 → 通过 ✅
+          → Links::postLink() → URL 查重: 若原 URL 已存在 → 返回 409 Conflict
+          → 但若原书签已被删除 → 重放成功创建新书签 ⚠️
+
+链路 2: 删除操作重放
+  T=0s    合法用户: DELETE /api/v1/links/42  Authorization: Bearer <token> (iat=T0)
+          → 成功删除书签 42 → 返回 204 No Content
+
+  T=300s  攻击者: 重放同一请求
+          → validateJwtToken(): 通过 ✅
+          → Links::deleteLink(): 若书签 42 已被恢复 → 再次删除 ⚠️
+          → 若书签 42 不存在 → 返回 404（无害但暴露了 ID 存在性）
+
+链路 3: 标签操作重放（影响面最大）
+  T=0s    合法用户: DELETE /api/v1/tags/oldtag  Authorization: Bearer <token>
+          → Tags::deleteTag() → 遍历所有含 oldtag 的书签 → Bookmark::deleteTag()
+          → BookmarkFileService::set() × N → BookmarkFileService::save()
+
+  T=300s  攻击者: 重放同一请求
+          → validateJwtToken(): 通过 ✅
+          → 若 oldtag 被重新添加到书签 → 再次删除所有含该标签的书签标签 ⚠️
+          → 副作用: N 个书签 updated 时间戳被重置 + N 条历史记录 + 缓存全量失效
+
+链路 4: PUT rename 重放
+  T=0s    合法用户: PUT /api/v1/tags/foo  {name: "bar"}  Authorization: Bearer <token>
+          → Tags::putTag() → 所有含 foo 的书签 renameTag("foo", "bar")
+
+  T=300s  攻击者: 重放同一请求
+          → validateJwtToken(): 通过 ✅
+          → 若 foo 已被重新添加 → 再次 rename → 但此时 bar 可能已存在 → 触发合并 ⚠️
+```
+
+**与页面 Session 的 XSRF 对比**：
+
+| 维度 | API JWT Token | 页面 Session + XSRF Token |
+|------|--------------|--------------------------|
+| 一次性消耗 | 无（同一 token 可用 9 分钟） | 有（每次表单 XSRF token 刷新） |
+| 重放窗口 | 9 分钟固定 | 仅限当前会话 + 单次提交 |
+| 写操作保护 | 依赖 HTTPS 保密性 | 依赖 XSRF token 一次性 + SameSite Cookie |
+
+**官方文档佐证**：[REST-API.md L34-44](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/doc/md/REST-API.md#L34-L44) 的 PHP 示例每次请求都**重新生成 token**，但这是客户端约定而非服务器强制。
+
+**缓解方案对比**：
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| 缩短有效期至 60 秒 | 无需改代码，改常量即可 | 对客户端时钟同步要求更高 |
+| 添加 jti + 服务端黑名单 | 一次性消耗，严格防重放 | 引入有状态，破坏无状态设计；需要存储 + 清理过期 jti |
+| 绑定请求方法+路径+Body 到签名 | Token 仅对特定请求有效 | 破坏"一个 token 多个请求"的使用模式 |
+| 要求客户端每次请求重新生成 token | 已有官方示例支持 | 仍非服务器强制，恶意客户端可复用 |
 
 ## 九、CORS 安全分析
 
@@ -800,5 +886,8 @@ Shaarli 的 REST API 设计体现了以下特点：
 2. **参数校验分层**：基础格式校验在控制器层，业务逻辑校验在服务层
 3. **权限模型简洁**：API 认证通过即拥有全部权限，私有内容通过 visibility 参数灵活过滤
 4. **错误体系完整**：从 400/401/404/409/500 覆盖主要错误场景，生产环境隐藏敏感错误细节
-5. **CORS 友好**：统一添加跨域头，便于前端集成
-6. **安全改进空间**：JWT 签名比对、alg 字段校验、CORS 配置、OPTIONS 鉴权等方面存在可优化点
+5. **CORS 友好**：统一添加跨域头，但 Slim 3 OPTIONS 自动合成 Route 存在缺头的可用性 Bug
+6. **alg:none 实际不可达**：硬编码 HS512 + 先签名后解析的顺序形成双重保护，但仍建议显式校验以防未来回归
+7. **Replay 风险存在**：9 分钟窗口内无 jti 一次性消耗，写操作可被重放
+8. **privateKey 与 API 隔离**：私有书签分享密钥机制仅存在于前端 Visitor 路由，API 路由完全不暴露该入口
+9. **安全改进空间**：JWT 签名比对、CORS/OPTIONS 联合修复、Replay 窗口缩短等方面存在可优化点
