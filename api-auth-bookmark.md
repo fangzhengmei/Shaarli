@@ -601,36 +601,197 @@ return $response
   - 如果浏览器实现存在漏洞，可能导致 CSRF 攻击：恶意网站可诱导用户携带 JWT Token 发起跨域请求
 - 更安全的配置应使用白名单域名，并动态设置 `Allow-Origin`
 
-### 9.2 OPTIONS 请求是否经过 ApiMiddleware
+### 9.2 OPTIONS 请求是否经过 ApiMiddleware：基于 Slim Router / RouteGroup 源码的栈帧追踪
 
 **路由配置**：[index.php 第 185-199 行](file:///d:/fz/0601-1/solo-dogfeeding/code/76-Shaarli/index.php#L185-L199)
 
 ```php
 $app->group('/api/v1', function () {
     $this->get('/info', '\Shaarli\Api\Controllers\Info:getInfo')->setName('getInfo');
-    // ... 其他路由定义
+    $this->get('/links', '\Shaarli\Api\Controllers\Links:getLinks')->setName('getLinks');
+    $this->get('/links/{id}', '\Shaarli\Api\Controllers\Links:getLink')->setName('getLink');
+    $this->post('/links', '\Shaarli\Api\Controllers\Links:postLink')->setName('postLink');
+    $this->put('/links/{id}', '\Shaarli\Api\Controllers\Links:putLink')->setName('putLink');
+    $this->delete('/links/{id}', '\Shaarli\Api\Controllers\Links:deleteLink')->setName('deleteLink');
+    $this->get('/tags', '\Shaarli\Api\Controllers\Tags:getTags')->setName('getTags');
+    $this->get('/tags/{tagName}', '\Shaarli\Api\Controllers\Tags:getTag')->setName('getTag');
+    $this->put('/tags/{tagName}', '\Shaarli\Api\Controllers\Tags:putTag')->setName('putTag');
+    $this->delete('/tags/{tagName}', '\Shaarli\Api\Controllers\Tags:deleteTag')->setName('deleteTag');
+    $this->get('/history', '\Shaarli\Api\Controllers\HistoryController:getHistory')->setName('getHistory');
 })->add('\Shaarli\Api\ApiMiddleware');
 ```
 
-**Slim 3 框架特性**：
-- Slim 3 内置 `Slim\Middleware\MethodOverrideMiddleware`，但未显式配置
-- Slim 3 对 OPTIONS 请求的处理逻辑：
-  - 若显式定义了 `$app->options()` 路由，则匹配该路由
-  - 若未定义，Slim 的 `Router` 会自动处理匹配路径的 OPTIONS 请求，返回允许的方法列表
-  - **关键点**：group 级别的 middleware 对自动生成的 OPTIONS 响应**同样生效**
+**源码引用**：以下分析基于 Slim 3.12.5 公开源码（`slim/slim: ^3.0`）。
 
-**代码追踪结论**：
-- API 组路由中未显式定义 OPTIONS 路由
-- Slim 框架自动生成的 OPTIONS 响应**仍会经过 ApiMiddleware**
-- 流程：
-  1. 浏览器发送 OPTIONS 预检请求到 `/api/v1/links`
-  2. Slim 路由器匹配到 `/api/v1` group
-  3. 执行 ApiMiddleware 中间件
-  4. ApiMiddleware 的 `checkRequest()` 会校验 JWT Token！
-  5. 预检请求通常不携带 Authorization 头 → 抛出 401 错误
-  6. 实际 CORS 预检失败
+#### 栈帧 1：App::group() 如何绑定中间件到 RouteGroup
 
-**这是一个 Bug**：CORS 预检请求（OPTIONS）不应要求认证，浏览器不会在预检请求中携带 Authorization 头。
+源码：`Slim\App::group()` (Slim 3.x App.php)
+
+```php
+public function group($pattern, $callable)
+{
+    $router = $this->container->get('router');
+    $group = $router->pushGroup($pattern, $callable);  // ← 创建 RouteGroup 并压入 router->routeGroups 栈
+    $group->setContainer($this->container);
+    $group($this);                                       // ← 执行闭包，闭包内的 $this->get/post/put/delete
+                                                         //    都会调用 Router::map()，此时 routeGroups 栈非空
+    $router->popGroup();                                 // ← 闭包执行完毕后弹栈
+    return $group;                                       // ← 返回 group 对象供链式 ->add()
+}
+```
+
+随后的 `->add('\Shaarli\Api\ApiMiddleware')` 调用 `RouteGroup::add()`（继承自 `Routable`），将中间件追加到 **RouteGroup 自身的 `$middleware` 数组**，不是直接注入每个 Route。
+
+#### 栈帧 2：Router::map() 注册子路由时如何携带 group 引用
+
+源码：`Slim\Router::map()` (Slim 3.x Router.php)
+
+```php
+public function map($methods, $pattern, $callable)
+{
+    $pattern = $this->processGroups($pattern);          // ← 叠加所有 group 的前缀，得到 "/api/v1/links"
+    $route = $this->createRoute(
+        $methods, $pattern, $callable,
+        $this->routeGroups                               // ← 关键：传入当前 routeGroups 栈的**副本**
+    );
+    $this->routes[] = $route;
+    return $route;
+}
+```
+
+每个 Route 对象在构造时持有对当前活跃 RouteGroup 栈的引用。`$this->routeGroups` 在闭包执行期间包含 `/api/v1` 这个 group。
+
+#### 栈帧 3：Route::finalize() 延迟从 groups 收集中间件
+
+源码：`Slim\Route::finalize()` (Slim 3.x Route.php)
+
+```php
+public function finalize()
+{
+    if ($this->finalized) {
+        return;
+    }
+    $groupMiddleware = [];
+    foreach ($this->getGroups() as $group) {             // ← 遍历 Route 持有的 RouteGroup 引用
+        $groupMiddleware = array_merge($group->getMiddleware(), $groupMiddleware);
+    }
+    $this->middleware = array_merge($this->middleware, $groupMiddleware);
+    foreach ($this->getMiddleware() as $middleware) {
+        $this->addMiddleware($middleware);               // ← 解析为真实 callable，包装成 DeferredCallable
+    }
+    $this->finalized = true;
+}
+```
+
+**关键点**：group middleware 不是在路由注册时立即附加的，而是在 `finalize()` 中**延迟收集**。`finalize()` 仅在 `Route::run()` 中被调用。
+
+#### 栈帧 4：App::__invoke() 分派请求
+
+源码：`Slim\App::__invoke()` (Slim 3.x App.php)
+
+```php
+public function __invoke(ServerRequestInterface $request, ResponseInterface $response)
+{
+    $routeInfo = $request->getAttribute('routeInfo');
+    $router = $this->container->get('router');
+    if (null === $routeInfo || ($routeInfo['request'] !== [...])) {
+        $request = $this->dispatchRouterAndPrepareRoute($request, $router);
+        $routeInfo = $request->getAttribute('routeInfo');
+    }
+    if ($routeInfo[0] === Dispatcher::FOUND) {
+        $route = $router->lookupRoute($routeInfo[1]);    // ← 通过 route 标识符找到 Route 对象
+        return $route->run($request, $response);          // ← 这里才会调用 Route::run() → finalize()
+    } elseif ($routeInfo[0] === Dispatcher::METHOD_NOT_ALLOWED) {
+        $notAllowedHandler = $this->container->get('notAllowedHandler');
+        return $notAllowedHandler($request, $response, $routeInfo[1]);  // ← 另一条分支，不经过 Route
+    }
+    throw new NotFoundException($request, $response);
+}
+```
+
+#### 栈帧 5：FastRoute dispatch 对 OPTIONS 的分派结果
+
+Slim 3 使用 `nikic/FastRoute` 作为路由引擎。对 `OPTIONS /api/v1/links`：
+
+- FastRoute 扫描已注册路由，发现 `/api/v1/links` 只注册了 `GET`、`POST`
+- 返回 `[Dispatcher::METHOD_NOT_ALLOWED, ['GET', 'POST']]`
+- **没有走 FOUND 分支**，直接进入 METHOD_NOT_ALLOWED 分支 → 调用 `notAllowedHandler`
+- Slim 默认 `notAllowedHandler` 抛出 `MethodNotAllowedException`，产生 405 响应
+
+#### 栈帧 6：notAllowedHandler 是否经过 group middleware？
+
+**不经过**。`notAllowedHandler` 是 Slim App 级别的回调，与任何 Route 对象都没有关联：
+- 没有调用 `$route->run()` → `finalize()` 没被触发 → Route 从未从 RouteGroup 收集 ApiMiddleware
+- 即使有某个全局 App middleware 可能被调用，ApiMiddleware 只挂在 `/api/v1` RouteGroup 上，不在 App 级别
+
+#### 完整执行栈帧图
+
+```
+浏览器: OPTIONS /api/v1/links
+    │
+    ▼
+Slim\App::process()
+    │  App 作为自己中间件栈的最内层 callable
+    ▼
+Slim\App::__invoke()
+    │  dispatchRouterAndPrepareRoute()
+    │  └─► FastRoute\Dispatcher\GroupCountBased::dispatch('OPTIONS', '/api/v1/links')
+    │        返回: [METHOD_NOT_ALLOWED, ['GET', 'POST']]
+    │
+    ▼ 走 METHOD_NOT_ALLOWED 分支（非 FOUND 分支）
+Slim\Container::get('notAllowedHandler')
+    │
+    ▼
+notAllowedHandler($request, $response, ['GET', 'POST'])
+    │  抛出 MethodNotAllowedException
+    │  → 生成 405 响应，含 Allow: GET, POST 头
+    │
+    │  ❌ Route::run() 从未被调用
+    │  ❌ Route::finalize() 从未被调用
+    │  ❌ ApiMiddleware 从未被 Route 中间件栈触发
+    │  ❌ checkRequest() 未执行（也因此不会 401）
+    │  ❌ ApiMiddleware::__invoke 末尾的 CORS 头未附加
+    │
+    ▼
+最终响应: 405 Method Not Allowed
+    └─ 无 Access-Control-Allow-Origin 头
+    └─ 无 Access-Control-Allow-Headers 头
+    └─ 无 Access-Control-Allow-Methods 头
+       → 浏览器 CORS 预检失败，跨域 API 完全不可用
+```
+
+#### 结论
+
+**OPTIONS 请求不经过 ApiMiddleware。** 真实原因不是"OPTIONS 被 401"，而是 FastRoute 返回 `METHOD_NOT_ALLOWED` 直接走 `notAllowedHandler` 分支，彻底绕过了 `Route::run()` → `finalize()` → group middleware 这条链路。响应是 **405**（不是 401），但缺少 CORS 头导致浏览器拦截。
+
+| 请求 | FastRoute 结果 | Route::run() 调用? | ApiMiddleware 经过? | 响应带 CORS 头? |
+|------|---------------|------------------|-------------------|----------------|
+| GET/POST/PUT/DELETE | FOUND | ✅ → finalize() | ✅ | ✅ |
+| OPTIONS | METHOD_NOT_ALLOWED | ❌ | ❌ | ❌ |
+
+**修复方案**（必须两步联合）：
+
+**步骤 A**：在 API group 闭包内显式注册 OPTIONS 路由，使其经过 group middleware 管道
+```php
+$app->group('/api/v1', function () {
+    // ... 原有路由
+    $this->options('/{routes:.+}', function ($request, $response) {
+        return $response;  // 空响应体，中间件会补 CORS 头
+    });
+})->add('\Shaarli\Api\ApiMiddleware');
+```
+
+**步骤 B**：ApiMiddleware::checkRequest() 中跳过 OPTIONS 方法的 JWT 校验
+```php
+protected function checkRequest($request)
+{
+    if (! $this->conf->get('api.enabled', true)) {
+        throw new ApiAuthorizationException('API is disabled');
+    }
+    if ($request->getMethod() !== 'OPTIONS') {
+        $this->checkToken($request);
+    }
+}
 
 ## 十、is_integer_mixed 函数追踪
 
@@ -886,8 +1047,7 @@ Shaarli 的 REST API 设计体现了以下特点：
 2. **参数校验分层**：基础格式校验在控制器层，业务逻辑校验在服务层
 3. **权限模型简洁**：API 认证通过即拥有全部权限，私有内容通过 visibility 参数灵活过滤
 4. **错误体系完整**：从 400/401/404/409/500 覆盖主要错误场景，生产环境隐藏敏感错误细节
-5. **CORS 友好**：统一添加跨域头，但 Slim 3 OPTIONS 自动合成 Route 存在缺头的可用性 Bug
-6. **alg:none 实际不可达**：硬编码 HS512 + 先签名后解析的顺序形成双重保护，但仍建议显式校验以防未来回归
-7. **Replay 风险存在**：9 分钟窗口内无 jti 一次性消耗，写操作可被重放
-8. **privateKey 与 API 隔离**：私有书签分享密钥机制仅存在于前端 Visitor 路由，API 路由完全不暴露该入口
-9. **安全改进空间**：JWT 签名比对、CORS/OPTIONS 联合修复、Replay 窗口缩短等方面存在可优化点
+5. **alg:none 不可达**：硬编码 HS512 + 先签名后解析的执行顺序形成双重保障，但仍建议显式校验 alg 以防未来回归
+6. **Replay 风险存在**：9 分钟窗口内无 jti 一次性消耗，写操作（POST/PUT/DELETE 书签、PUT/DELETE 标签）可被重放
+7. **CORS 可用性缺陷**：OPTIONS 请求不经过 ApiMiddleware（FastRoute 返回 METHOD_NOT_ALLOWED → notAllowedHandler），CORS 头缺失导致跨域 API 不可用
+8. **privateKey 与 API 隔离**：私有书签分享密钥仅前端 Visitor 路由可用，API 路由完全不暴露该入口
