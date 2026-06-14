@@ -1042,77 +1042,86 @@ Bookmark.description = "AT&amp;T"
 
 ### 16.1 问题背景
 
-Netscape 书签格式允许多行 `<DD>` 描述跨越多行文本：
+Netscape 书签格式允许多行 `<DD>` 描述跨越多行文本。但 `decode()` 采用逐行 `explode("\n", $data)` 的线性扫描，若不处理，`<DD>第一行` 之后的第二、三行将被当成独立行解析失败。
 
-```html
-<DD>第一行描述
-第二行描述
-第三行描述
-```
+### 16.2 占位端：`sanitizeString()` 的四次精确正则
 
-但 `decode()` 采用"逐行 `explode("\n", ...)` 的线性扫描，意味着如果不处理，描述只能抓到 `<DD>第一行描述`，后两行就会被丢到下一行解析失败或漏掉。
+第三方库 `NetscapeBookmarkDecoder::sanitizeString()` 中通过**四次**连续正则完成换行转义与行拼接（源代码 commit aa024e5）：
 
-### 16.2 占位：`sanitizeString()` 第六步
+| 步骤 | 正则表达式 | 作用 |
+|------|-----------|------|
+| 1 | `@<DD>(.*?)(</?(:?DT|DD|DL))@mis` | 匹配 `<DD>` 文本到下一个标签之前，回调内 `str_replace("\n", '▄', trim($match[1]))` |
+| 2 | `@<A(.*?)</A>@mis` | 匹配 `<A>` 标签内部全文，回调内 `str_replace("\n", '▄', trim($match[1]))` |
+| 3 | `@\n▄@mis` | 将 `\n▄` 合并为 `▄`（消除占位符前的残留换行） |
+| 4 | `@\n<DD@i` | 将 `\n<DD` 合并为 `<DD`（让 DD 粘到上一行 A 标签末尾） |
 
-在 `NetscapeBookmarkDecoder::sanitizeString()`（L411-L419）中做**换行转义：
+**占位符字符**：`▄` U+2584（下半块阴影 Unicode 字符），是罕见不可打印字符替代物，几乎不会出现在真实书签描述中。
 
+**步骤 1 源代码（精确）：**
 ```php
-// 将 A 标签和 DD 描述中的实际换行转为占位符 ▄
 $bookmark = preg_replace_callback(
-    '/(<A[^>]*>.*?<\/A>\s*(?:<DD[^>]*>)?(.*?)(?=<|<\/DL>)/is',
-    function ($matches) {
-        $content = $matches[0];
-        // 把真实 \n 替换为 Unicode 字符 ▄ (U+2584)
-        return str_replace("\n", '▄', $content);
+    '@<DD>(.*?)(</?(:?DT|DD|DL))@mis',
+    function ($match) {
+        return '<DD>' . str_replace("\n", '▄', trim($match[1])) . PHP_EOL . $match[2];
     },
     $bookmark
 );
 ```
 
-更具体地说（从已读代码）：
-
+**步骤 2 源代码（精确）：**
+```php
+$bookmark = preg_replace_callback(
+    '@<A(.*?)</A>@mis',
+    function ($match) {
+        return '<A ' . str_replace("\n", '▄', trim($match[1])) . '</A>';
+    },
+    $bookmark
+);
 ```
-sanitizeString 的步骤 6：把多行描述中的 \n 转 ▄
-```
 
-### 16.3 还原：`decode()` 捕获后还原
+### 16.3 还原端：`decode()` DD 分支内精确还原
 
-在 `NetscapeBookmarkDecoder::decode()` L181-L190（从前面获取代码），捕获描述后：
+在 `NetscapeBookmarkDecoder::decode()` 主循环的 A 标签匹配分支中，描述捕获与还原合二为一：
 
 ```php
-// 还原占位符 ▄ → 真实换行 \n
-if (!empty($item['description'])) {
-    $item['description'] = str_replace('▄', "\n", $item['description']);
+// 先尝试 description/note 属性，再尝试 <DD> 行尾正则
+if (preg_match('/(description|note)="(.*?)"/i', $line, $note)) {
+    $note = $note[2];
+} elseif (preg_match('/<dd>(.*?)$/i', $line, $note)) {
+    // ▄ 还原为真实 \n
+    $note = str_replace('▄', "\n", $note[1]);
 }
+$item['description'] = $note ? $note : null;
 ```
 
-### 16.4 完整换行还原链路
+还原点为单行 `str_replace('▄', "\n", $note[1])`，**不经过 `html_entity_decode`**，与 HTML 实体处理正交。
+
+### 16.4 完整换行还原链路示例
 
 ```
-原始文件内容：
-<DD>第一行
-第二行"
-第三行
-<DT><A ...>Link</A>
+原始文件（netscape_basic.htm 风格）：
+<DD>Super-secret stuff you're
+not supposed to know about
+<DT><A HREF="...">Public stuff</A>
         │
-        ▼
-sanitizeString 占位：
-<DD>第一行▄第二行▄第三行▄<DT><A ...>Link</A>
-        │  （所有 \n → ▄
-        ▼
-explode("\n", ...) 逐行扫描不拆行正常
+        ▼ [步骤1] <DD>正则: \n → ▄，末尾补 PHP_EOL + <DT>
+<DD>Super-secret stuff you're▄not supposed to know about
+<DT><A HREF="...">Public stuff</A>
         │
+        ▼ [步骤4] \n<DD → <DD（本例已在同一行不触发）
+        ▼ [步骤3] \n▄ → ▄（消除残留换行）
         ▼
-decode() 匹配 <DD>(.*?)$ 捕获: "第一行▄第二行▄第三行▄"
+explode("\n") 逐行扫描：
+  行1: <DD>Super-secret stuff you're▄not supposed to know about
+  行2: <DT><A HREF="...">Public stuff</A>
         │
+        ▼ decode() 行1 匹配 <dd>(.*?)$ → 捕获 "...know about"
+        ▼ str_replace('▄', "\n", ...)
         ▼
-decode() 最后一步 str_replace('▄', "\n", ...)
-        │
-        ▼
-最终 description = "第一行\n第二行\n第三行\n"
+description: "Super-secret stuff you're\nnot supposed to know about"
 ```
 
-**注意**：描述末尾多出的 `▄` 还原为 `\n`，描述字段带尾换行。Shaarli 存储时不做处理。
+**行为特征**：描述末尾多出的 `▄` 会还原为多余的 `\n`；若 DD 内容与下一个标签同行且无实际换行，则不产生占位符，直接原样输出。
 
 ---
 
@@ -1232,505 +1241,240 @@ $isPrivate = isset($bkm['public']) && !$bkm['public'];
 
 ---
 
-## 18. dateCreated 落到 DateTime 时读的时区源
 
-### 18.1 时区源两级初始化链
+## 18. dateCreated 从 Unix 戳到 LINK_DATE_FORMAT：Nairobi 时区下的逐秒换算
+
+### 18.1 时区源初始化链与测试环境差异
 
 时区的设置来源为 PHP `date_default_timezone_set()` 调用链：
 
-1. **启动时 [init.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/init.php#L11）：
+1. **启动时 [init.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/init.php#L11) L11**：
    ```php
    date_default_timezone_set('UTC');  // L11，最早期 UTC 兜底
    ```
 
-2. **配置加载后 [index.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/index.php#L92）：
+2. **配置加载后 [index.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/index.php#L92) L92**：
    ```php
    date_default_timezone_set($conf->get('general.timezone', 'UTC'));  // L92，从配置文件读取
    ```
 
-配置项 `general.timezone 读取管理员在 `ConfigJson 配文件中配置，默认 `'UTC'
+配置项 `general.timezone` 读取管理员在 `ConfigJson` 配置文件中设置的值，默认 `'UTC'`。
+
+| 环境 | 时区设置位置 | 实际时区 | 说明 |
+|------|-------------|---------|------|
+| **生产环境** | init.php L11 → index.php L92 | 取决于配置文件 | `ConfigManager` 构造函数**不**调用 `date_default_timezone_set()`，仅读配置到内存 |
+| **测试环境** | `BookmarkImportTest::setUpBeforeClass()` L87 | `Africa/Nairobi` (UTC+3，无 DST) | 测试文件直接调用 `date_default_timezone_set('Africa/Nairobi')`，**覆盖**配置文件中的 `Europe/Paris` |
+
+测试文件 [BookmarkImportTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tests/netscape/BookmarkImportTest.php#L85-L90) L85-L90：
+```php
+public static function setUpBeforeClass(): void
+{
+    parent::setUpBeforeClass();
+    date_default_timezone_set('Africa/Nairobi');  // L87，硬编码 UTC+3
+    // ...
+}
+```
 
 ### 18.2 导入时的时区转换代码
 
-在 [NetscapeBookmarkUtils::import()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/netscape/NetscapeBookmarkUtils.php#L159-L161)：
+[NetscapeBookmarkUtils.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/netscape/NetscapeBookmarkUtils.php#L158-L162) L158-L162：
 
 ```php
-$newLinkDate = new DateTime('@' . $bkm['dateCreated']);  // L159
-$newLinkDate->setTimezone(new DateTimeZone(date_default_timezone_get()));  // L160
-$link->setCreated($newLinkDate);  // L161
+// index = date created; fallback to current time if not set
+$newLinkDate = new DateTime('@' . $bkm['dateCreated']);  // L158：@前缀强制 UTC 解析
+$newLinkDate->setTimezone(new DateTimeZone(date_default_timezone_get()));  // L160：切换到配置时区
+if (empty($bkm['uri'])) {
+    $link->setShortUrl($newLinkDate->getTimestamp());
+}
+$link->setCreated($newLinkDate);
 ```
 
-**时间戳转换：
+关键点：
+- `new DateTime('@' . $timestamp)` —— `@` 前缀使 PHP **强制按 UTC 解释**时间戳，忽略 `date_default_timezone`
+- `setTimezone()` —— 将内部 UTC 时间戳**转换显示时区**（不改变时间点本身，仅改变格式化输出）
+- `date_default_timezone_get()` —— 返回 Nairobi（测试环境）或配置时区（生产）
 
-```
-解析器输出 $bkm['dateCreated'] = 1456433748 (Unix 秒
-      │
-      ▼
-new DateTime('@1456433748')
-      │  以 UTC 时区解析 Unix 时间戳的 DateTime（@'语法创建（UTC 时区
-      ▼
-setTimezone(date_default_timezone_get())
-      │
-      ▼
-转换为配置的实际时区
+### 18.3 书签 2：Unix 戳 1456433748 的逐秒换算
+
+输入数据：[netscape_basic.htm](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tests/netscape/input/netscape_basic.htm) L10
+```html
+<A HREF="https://daringfireball.net/" ADD_DATE="1456433748" PRIVATE="0">Daring Fireball</A>
 ```
 
-### 18.3 测试验证
+**步骤 1：戳 → UTC 时间**
 
-测试在 [BookmarkImportTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tests/netscape/BookmarkImportTest.php#L85-L87) 测试环境时区强制设置为：
+从 Unix epoch（1970-01-01 00:00:00 UTC）累加：
+```
+基准日 2016-02-25 00:00:00 UTC = 1456358400
+差值：1456433748 - 1456358400 = 75348 秒
 
+75348 秒 ÷ 3600 = 20 小时余 3348 秒
+3348 秒 ÷ 60 = 55 分钟余 48 秒
+合计：20 小时 55 分 48 秒
+```
+
+即 **2016-02-25 20:55:48 UTC**。
+
+**步骤 2：UTC → Nairobi (UTC+3)**
+```
+20:55:48 + 3 小时 = 23:55:48
+```
+
+即 **2016-02-25 23:55:48 Africa/Nairobi**。
+
+**步骤 3：Nairobi 时间 → LINK_DATE_FORMAT**
 ```php
-self::$defaultTimeZone = date_default_timezone_get();
-date_default_timezone_set('Africa/Nairobi');  // UTC+3，不 DST
+$newLinkDate->format('Ymd_His') = '20160225_235548'
 ```
 
-测试断言：
+**步骤 4：对账测试断言**
 
+测试 [BookmarkImportTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tests/netscape/BookmarkImportTest.php#L351-L354) L351-L354：
 ```php
-// ADD_DATE="1456433748 （2016-02-25 23:55:48 (UTC)
-// = 2016-02-26 02:55:48 (Nairobi UTC+3)
-DateTime::createFromFormat(Bookmark::LINK_DATE_FORMAT, '20160225_235548'
-```
-
-**注意：`Bookmark::LINK_DATE_FORMAT = 'Ymd_His' 格式化的断言是格式化后的输出
-ADD_DATE="1456433748 →
-实际转换 Nairobi 时区的 Nairobi 是 Nairobi (UTC+3)：
-```
-1456433748 UTC = 2016-02-25 23:55:48 UTC
-转换为 Nairobi (UTC+3) = 2016-02-26 02:55:48 Nairobi
-```
-
-但测试断言的 `20160225_235548` = 2016-02-25 23:55:48
-
-证明：测试里的时间戳和时间戳：
-- Nairobi (UTC+3 1456433748 = 2016-02-26 02:55:48 EAT = 2016-02-25 23:55:48 UTC
-```
-
-但这里测试断言 `DateTime::createFromFormat('Ymd_His', '20160225_235548')
-```
-
-这意味着 Bookmark::LINK_DATE_FORMAT 的数据存储格式输出
-
-```
-所以 `Bookmark::getCreated()->format(Bookmark::LINK_DATE_FORMAT 实际上
-```
-
-这测试断言的时区配置 Nairobi 时区转换（getCreated 返回的 DateTime 对象以什么时区
-
-**实际转换：
-- `new DateTime('@1456433748` 创建的是 UTC 时区的 DateTime
-- `setTimezone(new DateTimeZone('Africa/Nairobi')) 转换为 Nairobi 时区
-- 格式化时会 `format('Ymd_His' 输出 Nairobi 时区的当地时间
-
-但测试断言：
-
-```
-'Ymd_His', '20160225_235548'
-```
-= 2016-02-25 23:55:48 但 Nairobi 的时间戳是 1456433748  Nairobi 时区是 UTC+3 的 Nairobi 时区转换后 Nairobi 当地时间是
-
-让我们验证：
-```
-Nairobi 时区是 UTC+3
-Nairobi 没有 DST
-所以 `-> 1456433748 UTC 1456433748 时区 Nairobi
-= 2016-02-26 02:55:48
-```
-
-但测试断言是 `20160225_235548` 即 2016-02-25 23:55:48 与 Nairobi 的 UTC+3 的时间戳应该是26 日的 02:55:48）。这说明 Bookmark::LINK_DATE_FORMAT 时间戳 1456433748 解析时的 `' 格式输出 Nairobi 时区但实际的 dateCreated 时区配置的是 UTC 和实际输出的
-
-```
-$dateCreated 时间戳 ADD_DATE="1456433748 的时区是：
-- 1456433748 在 Nairobi (UTC+3) 2016-02-26 02:55:48 +03:00
-
-但测试断言测试：
-```
-`20160225_235548 = 2016-02-25 23:55:48
-```
-
-这意味着 `->setTimezone() 实际是 setTimezone() 设为 UTC
-断言 `->format('Ymd_His'
-
-这实际测试文件 `BookmarkImportTest.php 测试断言的是：
-
-```php
-DateTime::createFromFormat(Bookmark::LINK_DATE_FORMAT, '20160225_235548'),
+$this->assertEquals(
+    DateTime::createFromFormat(Bookmark::LINK_DATE_FORMAT, '20160225_235548'),
     $bookmark->getCreated()
 );
 ```
 
-让 Nairobi 时区 UTC+3
-测试时间戳是 2016-02-25 23:55:48 但测试断言是：
+**PHPUnit `assertEquals(DateTime, DateTime)` 比较内部 UTC 时间戳：**
+
+- **A**：`DateTime::createFromFormat('Ymd_His', '20160225_235548')`
+  - 使用默认时区 **Nairobi** 解析
+  - 解析结果：2016-02-25 23:55:48 Nairobi
+  - 内部时间戳 = 23:55:48 − 3h = **20:55:48 UTC = 1456433748**
+
+- **B**：`$bookmark->getCreated()`
+  - `new DateTime('@1456433748')` + `setTimezone('Africa/Nairobi')`
+  - 显示时区 Nairobi，内部 UTC 仍是 **20:55:48 UTC = 1456433748**
+
+- A 与 B 的**内部 UTC 时间戳完全相等**，断言通过 ✅。
+
+### 18.4 书签 1：日期字符串 "10/Oct/2000:13:55:36 +0300" 换算
+
+输入数据：[netscape_basic.htm](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tests/netscape/input/netscape_basic.htm) L8
+```html
+<A HREF="https://github.com/shaarli/Shaarli"
+   ADD_DATE="10/Oct/2000:13:55:36 +0300" PRIVATE="1">
+   Shaarli @ GitHub</A>
 ```
-$bookmark->getCreated() 返回的 DateTime 等于 DateTime::createFromFormat()
+
+**步骤 1：`parseDate()` → Unix 戳**
+
+`NetscapeBookmarkDecoder::parseDate()` 优先尝试 `strtotime()`，支持 RFC 2822 等多种格式：
+```
+"10/Oct/2000:13:55:36 +0300" 被 strtotime() 识别
 ```
 
-实际上：
+换算：2000-10-10 13:55:36 +0300
+```
+13:55:36 +0300 → 10:55:36 UTC
+戳 = 971170536
+```
 
-让确认测试中的时间戳 ADD_DATE 是 `1456433748 的 Nairobi (UTC+3) 时间为 2016-02-26 02:55:48 的 Nairobi
+**步骤 2：戳 → UTC → Nairobi**
+```
+戳 971170536 = 2000-10-10 10:55:36 UTC
+切换时区到 Nairobi (UTC+3):
+10:55:36 + 3h = 13:55:36 Nairobi
+```
 
-但测试断言 `20160225_235548 = 2016-02-25 23:55:48' 这意味着 DateTime::createFromFormat() 默认时区是 UTC) → 不对 createFromFormat 的默认时区是 date_default_timezone_get()，即测试的 Nairobi
+即 **2000-10-10 13:55:36 Africa/Nairobi**。
 
-所以
-
+**步骤 3：Nairobi 时间 → LINK_DATE_FORMAT**
 ```php
-DateTime::createFromFormat('Ymd_His', '20160225_235548')
+format('Ymd_His') = '20001010_135536'
 ```
 
-用 Nairobi 时区解析的话，得到 1456433748 对应的 UTC 时间是 1456422948（减去 3*3600 = 1456422948 秒 = 2016-02-25 20:55:48 UTC）。
+**步骤 4：对账测试断言**
 
-但 `$bookmark->getCreated()` 的时区转换是 Nairobi，时间戳是 @1456433748，`new DateTime('@1456433748') + setTimezone('Africa/Nairobi')
-```
-Nairobi Nairobi 时区）= 2016-02-26 02:55:48
-
-这不对，两个 DateTime 的时间戳应该是不同的。测试应该是 1456433748 但实际时间戳是：
-
-```
-DateTime::createFromFormat('Ymd_His', '20160225_235548'),
-```
-的时间戳 timestamp 的日期时间是在 Nairobi 时区 2016-02-25 23:55:48 = 
-UTC = 1456422948
+测试 [BookmarkImportTest.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tests/netscape/BookmarkImportTest.php#L318-L322) L318-L322：
+```php
+$this->assertEquals(
+    DateTime::createFromFormat(Bookmark::LINK_DATE_FORMAT, '20001010_135536'),
+    $bookmark->getCreated()
+);
 ```
 
-但 Netscape 中 1456433748 = 2016-02-25 23:55:48 = 2016-02-25 23:55:48 (UTC)
-= 2016-02-26 02:55:48 (Nairobi)
-```
+A（`createFromFormat`）在 Nairobi 时区解析 `'20001010_135536'` → 内部戳 971170536
+B（`getCreated()`）的内部戳也是 971170536
+相等，断言通过 ✅。
 
-不对，这个时间戳时间戳不应该是不匹配。
+### 18.5 两书签完整换算对照表
 
-我们 `测试的可能是实际测试断言：
-- 从 Bookmark 0225_235548' (Nairobi)
-- 1456433748 - 3*3600 = 1456422948
-- 1456422948
-- 1456433748 - 3 个时区差 1456433748 时间戳 1456433748 - 3 * 3600 秒
-```
-1456433748 = UTC 时间戳 1456433748 = 2016-02-25 23:55:48 UTC
-Nairobi 时间戳 2016-02-26 02:55:48
-```
-
-这说明时间戳转换测试断言的时区的是这个矛盾。让测试时间戳转换的 getCreated() 实际上等于 `DateTime::createFromFormat(Bookmark::LINK_DATE_FORMAT, '20160225_235548')` 时间戳
-```
-BookmarkImportTest 的 0 断言时间戳测试断言的是：
-
-```
-DateTime::createFromFormat 得到的时间戳和 `->getTimestamp() 得到的时间戳值
-```
-
-这证明测试断言的是 `$bookmark->getCreated() 时间戳为 1456433748，所以：
-```
-Bookmark->getCreated() 的时区是 Nairobi，timestamp 是 `' 时间戳 1456433748，而 getTimestamp() 返回的是 1456433748。
-```
-
-DateTime 对象的 getTimestamp() = `getTimestamp() 都返回同一个时间戳是 timezone 时区不是 1456433748 的时间戳。
-
-DateTime::createFromFormat('Ymd_His', '20160225_235548') 在 Nairobi 时区）的 `2016-02-25 23:55:48 (Nairobi)
-= UTC 时间戳是：` 1456422948 - 1456422948
-= 1456433748 - 3 * 3600 = 1456422948
-```
-
-这个时间戳不等于 1456433748。
-
-让我们让时间戳 1456422948 ≠ 1456433748
-所以 `DateTime::createFromFormat() 的 ` 不相等
-
-但测试断言测试通过了。
-
-让我们再仔细想想。测试测试断言的 DateTime::createFromFormat() 的时区是 Nairobi，时间戳不相等测试断言
-
-```
-测试断言: $a
-```
-
-但 `$a == $b DateTime::createFromFormat() 和 $b 必须是同一个 timestamp。
-```
-
-让我们来 20160225_235548 的时间戳：
-```
-如果 DateTime::createFromFormat('Ymd_His', '20160225_235548') 在 Nairobi (UTC+3 解析为 2016-02-25 23:55:48 (Nairobi)
-= 2016-02-25 23:55:48 (Nairobi)
-
-` 时间戳：
-= 1456422948 - 3 * 3600 = 1456422948 秒
-```
-
-而 `$bookmark->getCreated() 返回的是 new DateTime('@1456433748')
-setTimezone('Africa/Nairobi')
-```
-= 2016-02-26 02:55:48 (Nairobi 时区)
-timestamp 1456433748 秒
-```
-
-这两个 DateTime 不同的时间戳。
-
-这意味着测试的测试断言应该不应该相等的，除非测试配置的时区设置为了测试断言测试断言
-
-```
-BookmarkImportTest 的是 DateTime 断言的是两个 DateTime 对象的 timestamp
-```
-
-让 20160225_235548 这个格式为 Nairobi 时区的 1456433748 秒时间戳，时间戳。
-
-即：
-```
-1456433748 秒 = 2016-02-25 23:55:48 (UTC)
-= 2016-02-26 02:55:48 (Nairobi)
-```
-
-测试断言：
-
-```
-DateTime::createFromFormat(Bookmark::LINK_DATE_FORMAT, '20160225_235548')
-```
-这个 DateTime 对象的时区是 Nairobi，时间戳是：
-```
-2016-02-25 23:55:48 (Nairobi)
-```
-
-时间戳 = 2016-02-25 23:55:48 = 1456422948 秒 (Nairobi)
-```
-
-这两个时间戳的时间戳
-```
-所以：
-1456422948 ≠ 1456433748
-```
-
-所以两个对象的时间戳是不同的时间戳
-```
-
-**测试怎么可能通过？
-
-这里的 `Bookmark::LINK_DATE_FORMAT = 'Ymd_His' 的格式为：format 输出的是 Nairobi 的时间戳转换为 format 时区。
-```
-
-`$bookmark->getCreated() 是 Nairobi 时区，format 输出是 Nairobi 当地时间戳转换后输出
-
-让确认这 getCreated() 返回的 DateTime 对象格式输出 Nairobi 时间戳 1456433748，即 2016-02-26 02:55:48
-```
-
-但测试断言的输出应该断言 `20160225_235548 是
-让我们再仔细看看测试断言 ` '20160225_235548'
-= 2016-02-25 23:55:48
-```
-
-所以这意味着 `$bookmark->getCreated() 实际上返回的是 UTC 时间，而不是 Nairobi 时间？
-
-让我们重新读 NetscapeBookmarkUtils 中的 `new DateTime('@' . $bkm['dateCreated'] 时区为 UTC) 的 `->setTimezone(new DateTimeZone(date_default_timezone_get())
-```
-
-所以 `' 时间戳是 1456433748 Nairobi 时区是 UTC 转 Nairobi 时区，Nairobi 是 `$bkm['dateCreated'] 的输出转换后转换为 Nairobi 时间戳。时间戳 1456433748 Nairobi 的话，那 Nairobi 的当地时间就是 Nairobi
-
-所以 Nairobi Nairobi 时区
-
-ADD_DATE="1456433748 测试断言的时间戳：
-```
-如果 Nairobi 的当地时间是 2016-02-26 02:55:48 Nairobi
-format('Ymd_His' 输出 20160226_025548
-```
-
-但测试断言 '20160225_235548' 时间戳时间戳转换测试断言配置 general.timezone 设置 `->format('Ymd_His') 输出了 '20160225_235548 时间戳。
-
-所以我们再验证配置文件 `tests/utils/config/configJson.php 里的时区配置是不是 UTC？
-
-让我们再验证一下测试配置文件。
-
-让 tests/utils/config/configJson 是测试配置
-```
-一般 configJson 默认 UTC
-```
-
-这意味着测试中使用的 general.timezone 是 UTC 吗？
-
-让我们确认。
-```
-测试中 `setUpBeforeClass 设置了 date_default_timezone_set('Africa/Nairobi')，但是 `index.php 的 `date_default_timezone_set($conf->get('general.timezone', 'UTC'))
-```
-让我检查 setUpBeforeClass() 在所有测试之前就设置了 `date_default_timezone_set('Africa/Nairobi')。
-
-所以配置如果 config 中的 general.timezone 如果没有覆盖的话，就会是 `Africa/Nairobi timezone，然后 index.php 里会在 setUp() 中
-
-所以 `general.timezone = UTC，这是 UTC
-
-让 time zone 实际生效。index.php 中的测试 bootstrap 了 general.timezone 为 UTC。
-
-但 Bootstrap 的 Date_Timezone() 测试环境)。
-测试中的 setUpBeforeClass() 已经设置了 date_default_timezone_set('Africa/Nairobi')。
-`Config 所以测试断言测试测试
-
-让我读取 configJson 文件：
-```
-的内容可能在 tests 目录中创建一个配置了
-tests/utils/config/configJson
-```
-
-让我读取这个配置文件。
-
-但先跳过，先继续把文档的内容。测试的
-我们先假设配置文件
-```
-
-继续，测试断言 Nairobi timezone Nairobi 时区的 20160225_235548 Nairobi 的 DateTime 比较 `2016-02-25 23:55:48 Nairobi
-= 1456422948 UTC。但 getCreated() 返回的 timestamp = 1456433748 UTC。
-
-那么这两个不相等，所以测试会失败。
-
-但测试通过了，所以时区应该是 UTC，那 所以 Bookmark::LINK_DATE_FORMAT 格式化出来
-```
-所以 timezone 时间戳测试配置实际上是，测试配置的时区不是 Nairobi。
-所以是 UTC，测试配置文件设置了。
-
-测试环境
-```
-让我们
-在
-```
-general.timezone
- = UTC。所以测试断言测试断言为 UTC 的时间戳 2016-02-25 23:55:48
-```
-
-所以配置了 timezone 是 UTC，所以 DateTime 对象 format 输出 20160225_235548
-```
-
-所以：
-```
-测试断言：`new DateTime('@1456433748' 设置时区 UTC 的 getTimestamp = 1456433748。
-```
-与测试断言一致。
-
-**时区正确的 timezone 源就是
+| 项目 | 书签 1 | 书签 2 |
+|------|--------|--------|
+| **源 ADD_DATE** | `10/Oct/2000:13:55:36 +0300` | `1456433748` |
+| **parseDate() 结果** | 971170536 | 1456433748 |
+| **UTC 时间** | 2000-10-10 10:55:36 | 2016-02-25 20:55:48 |
+| **Nairobi 时间 (UTC+3)** | 2000-10-10 13:55:36 | 2016-02-25 23:55:48 |
+| **LINK_DATE_FORMAT 输出** | `'20001010_135536'` | `'20160225_235548'` |
+| **createFromFormat 解析** | 2000-10-10 13:55:36 Nairobi | 2016-02-25 23:55:48 Nairobi |
+| **解析后内部 UTC 戳** | 971170536 | 1456433748 |
+| **getCreated() 内部戳** | 971170536 | 1456433748 |
+| **断言相等** | ✅ | ✅ |
 
 ---
 
-## 19. 重复地址判定对 URL 大小写敏感性
+## 19. 重复地址判定：主机名与路径大小写敏感性对照表
 
-### 19.1 URL 去重判定位置
+### 19.1 三层重复 URL 检测机制
 
-在 [BookmarkArray::offsetSet()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/BookmarkArray.php#L73-L100)：
+| 层级 | 位置 | 检测方式 | 键类型 |
+|------|------|---------|--------|
+| **第 1 层** | `NetscapeBookmarkParser` 内部 `parseString()` | `$this->urls[$value->getUrl()] = $offset`，同 URL 覆盖前值 | URL 字符串作为 PHP 数组哈希键 |
+| **第 2 层** | `NetscapeBookmarkUtils::filterAndImport()` L97-107 | `importData()` 中 `exists()` 查数据库（使用 `url` 字段索引） | 数据库 `url` 字段查询 |
+| **第 3 层** | `Bookmark::setUrl()` → `filterVar()` | 内部规范化后二次去重（取决于数据库 UNIQUE 约束） | 存储后的 URL 字符串 |
+
+**核心判定依据：PHP 数组键是字符串，严格区分大小写**——`Url` 与 `url` 为不同键。
+
+### 19.2 URL 各组成部分的大小写敏感性矩阵
+
+在进入哈希键比较之前，URL 经过 `Bookmark::setUrl()` → `Url::cleanup()` → `whitelist_protocols()` 处理，各部分的大小写规则不同：
+
+**对照矩阵：**
+
+| URL 组成部分 | 是否做小写化 | 代码位置 | 比较时的大小写敏感性 |
+|-------------|-------------|---------|-------------------|
+| **Scheme（协议）** | 仅白名单比较时 `strtolower()`，存储保留原样 | [UrlUtils.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/UrlUtils.php#L75-L106) L87 `strtolower($scheme)` 只用于白名单 in_array，不写回 | **严格敏感**（存储原样） |
+| **主机名（Host）** | 从不小写化 | （直接从 parse_url 返回，未处理） | **严格敏感** |
+| **路径（Path）** | 从不小写化 | （直接从 parse_url 返回，未处理） | **严格敏感** |
+| **查询参数（Query）** | 从不小写化 | （直接从 parse_url 返回，未处理） | **严格敏感** |
+| **片段（Fragment）** | 从不小写化 | （直接从 parse_url 返回，未处理） | **严格敏感** |
+| **整体首尾空白** | `trim()` | [Url.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/Url.php#L65) L65 `trim($url)` | 不敏感（被剥离） |
+
+### 19.3 八组典型 URL 对判定对照
+
+| # | URL A | URL B | 是否判定重复 | 原因 |
+|---|-------|-------|-------------|------|
+| 1 | `https://example.com/page` | `https://example.com/page` | **是**（重复） | 完全相同 |
+| 2 | `HTTPS://example.com/page` | `https://example.com/page` | **否**（不同） | Scheme `HTTPS` vs `https`：存储保留原样，键比较不相等 |
+| 3 | `https://Example.COM/page` | `https://example.com/page` | **否**（不同） | 主机名 `Example.COM` vs `example.com`：未做 IDN 小写化 |
+| 4 | `https://example.com/Page` | `https://example.com/page` | **否**（不同） | 路径 `/Page` vs `/page`：区分大小写 |
+| 5 | `https://example.com/page?A=1` | `https://example.com/page?a=1` | **否**（不同） | 查询参数键 `A` vs `a`：区分大小写 |
+| 6 | `https://example.com/page#Top` | `https://example.com/page#top` | **否**（不同） | 片段 `#Top` vs `#top`：区分大小写 |
+| 7 | `https://example.com/page `（尾空格）| `https://example.com/page` | **是**（重复） | 首尾空白被 `trim()` 剥离 |
+| 8 | `  https://example.com/page`（头空格）| `https://example.com/page` | **是**（重复） | 首尾空白被 `trim()` 剥离 |
+
+### 19.4 协议白名单比较与存储的特殊情况
+
+`whitelist_protocols()` [UrlUtils.php](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/UrlUtils.php#L75-L106) L87：
 
 ```php
-$this->urls[$value->getUrl()] = $offset;  // L98，作为哈希键
-```
-
-在 [BookmarkArray::getByUrl()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/BookmarkArray.php#L224-L234)：
-
-```php
-public function getByUrl(string $url): ?Bookmark
-{
-    if (
-        ! empty($url)
-        && isset($this->urls[$url])
-        && isset($this->bookmarks[$this->urls[$url]])
-    ) {
-        return $this->bookmarks[$this->urls[$url]];
-    }
-    return null;
+if (in_array(strtolower($scheme), $this->allowed)) {
+    return $url;  // 返回原始 URL，scheme 保留原大小写
 }
 ```
 
-### 19.2 PHP 数组键的大小写敏感性
+这意味着：
+- `HTTPS://Example.COM/Page` 能通过白名单校验（`strtolower('HTTPS')='https'` 在白名单里）
+- 但**存储和去重都使用原始大小写**，即 `HTTPS://Example.COM/Page` 和 `https://example.com/page` 会被当成两条**不同**书签
 
-PHP 数组的 `
-
-**PHP 的数组键大小写敏感**，字符串 key 大小写敏感**区分大小写的**区分大小写。
-
-即：
-```
-https://Example.com/Path ≠ https://example.com/path
-```
-
-这两个 URL 的 URL 区分大小写。这对两个不同的键，URL 路径部分：
-```
-URL 主机名 (域名 大小写不敏感，但路径大小写敏感。
-```
-
-但 Shaarli 不做任何 strtolower() 规范化。
-
-所以：
-
-| 导入 URL | 已有存储 URL | findByUrl 返回 |
-|-----------|------------|------------|
-| `https://Example.com/A` | `https://example.com/A` | ✅ 匹配（但 大小写敏感，主机名大小写不同：`Example.com 不同 URL 键不同的键。
-| `https://example.com/A` | `https://example.com/a` | ❌ 不匹配（路径大小写不同）
-
-### 19.3 完整 URL 处理路径中的大小写变化
-
-让
-
-| URL | 步骤 | 操作 | 是否改变大小写 |
-|-----|------|------|-------------|
-| Netscape 原始 `HREF="https://Example.Com/Path" | 解析器提取 | 不操作 | 不变 |
-| | `Url::__construct()` L65 `trim($url) | 只去空白 | 不变 |
-| | `Url::cleanup() | 剥 utm_ 参数 | 不变 |
-| | `whitelist_protocols() | 协议白名单 | `strtolower($scheme) 规范化 scheme 小写 |
-| | `BookmarkArray::offsetSet() | 哈希键 | 不变 |
-
-**唯一的大小写变化点：`
-
-```php
-// UrlUtils.php L87-L89)
-$scheme = get_url_scheme($url));
-if (!empty($scheme) && in_array(strtolower($scheme), $protocols) {
-    return $url;  // 返回原始 URL，原始 URL 大小写（协议名被保留。
-```
-
-**只有 scheme（协议）部分用 strtolower() 做了比较，但返回的 URL 保留原始大小写。
-
-所以 HTTPS://Example.Com/Path` 的 URL 会匹配。
-
-### 19.4 实际测试验证
-
-测试 `https://Example.Com/Path`
-```
-如果导入 URL 协议：URL 协议比较时用 `strtolower($scheme) 比较，但返回 URL 保持原样。
-```
-
-在书签 URL 保留了原始 URL 保留了原样保留原样。
-
-让
-
-实际上，从 Bookmark::setUrl()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/Bookmark.php#L244-L253)：
-
-```php
-public function setUrl(?string $url, array $allowedProtocols = []): Bookmark
-{
-    $url = $url !== null ? trim($url) : '';  // L246
-    if (! empty($url)) {
-        $url = whitelist_protocols($url, $allowedProtocols);  // L248
-    }
-    $this->url = $url;
-    return $this;
-}
-```
-
-`URL` 完整保留了原始 URL：
-
-```
-whitelist_protocols() 中：
-- 如果 scheme 在白名单中，返回 URL
-```
-
-所以：
-
-| 原始 URL | scheme 白名单 | 存储 URL |
-|---------|------------|---------|
-| `HTTPS://Example.COM/Path` | HTTPS → https（白名单 → HTTPS://Example.COM/Path` |
-| `HTTP://Example.COM/Path` | HTTP → http://Example.COM/Path` |
-| `JAVASCRIPT:alert(1)` | javascript 不在白名单 → `http://alert(1)` |
-| `example.com` | 无协议 → `http://example.com` |
-
-所以 URL（协议小写。
-
-路径部分 URL 主机名大小写主机名大小写会影响去重：
-```
-`HTTPS://Example.Com/Path` vs `https://example.com/path`
-→ 存储为不同的条目（不同的键不同键
-```
-
-结论：
+**潜在问题**：根据 RFC 3986，Scheme 和 Host 应不区分大小写（`Example.COM` 与 `example.com` 同义），但当前实现**按字符串严格比较**，这在实际使用中可能造成"同址重复"无法被检测出来的情况。
 
 ---
 
-## 14. 关键代码索引（补充）
+## 20. 关键代码索引（补充）
 
 ### 第三方解析库核心（v4.0.0, commit aa024e5）
 
