@@ -2327,3 +2327,651 @@ BookmarkArray 内部结构更稳定，主要属性（`$bookmarks`、`$ids`、`$k
 | updates.txt | ⚠️ 中 | 旧版不认新版的方法名，全部重跑 | 低（幂等方法安全） |
 | page cache | ✅ 低 | 缓存失效，重新生成 | 无 |
 | history.php | ⚠️ 中 | 历史记录格式可能不兼容 | 低（不影响核心功能） |
+
+---
+
+## 二十一、权限受限下 flock 失败：SELinux/AppArmor 限制的 LockAcquireException 链路
+
+### 21.1 SELinux/AppArmor 阻断 flock 的触发场景
+
+在启用了强制访问控制（MAC）的 Linux 系统上，即使文件存在且 Unix 权限（chmod）正确，flock 系统调用仍可能被策略拒绝：
+
+| 场景 | SELinux/AppArmor 行为 | flock() 返回值 |
+|------|----------------------|----------------|
+| PHP 进程运行在 `httpd_t` 域，init.php 文件标记为 `httpd_sys_content_t`（只读内容） | SELinux 拒绝 `httpd_t` 域对 `httpd_sys_content_t` 类型文件的 `lock` 权限 | `false` + PHP Warning + `/var/log/audit/audit.log` 中出现 AVC 拒绝记录 |
+| AppArmor 配置文件仅允许 PHP `read` 访问 `/var/www/shaarli/`，未授予 `lock` 能力 | AppArmor 拒绝 flock 系统调用 | `false` + PHP Warning + `/var/log/syslog` 或 `journalctl` 中出现 DENIED 记录 |
+| Docker/容器化部署中 seccomp 配置过滤了 flock 系统调用 | 系统调用被 EACCES 或 EPERM 拦截 | `false` + Warning |
+| PHP-FPM 运行在受限 user namespace 中 | 锁的文件描述符传递被命名空间隔离破坏 | `false` 或异常行为 |
+
+### 21.2 异常传播完整链路（与 fopen=false 的差异）
+
+SELinux/AppArmor 拒绝的情况与 fopen 返回 false 的路径有**关键差异**：
+
+```
+SELinux/AppArmor 场景链路：
+
+ContainerBuilder 构造 bookmarkService
+    │
+    ├─ fopen(SHAARLI_MUTEX_FILE, 'r')
+    │     │
+    │     └─ SELinux 允许 read → 返回有效 resource（≠ false）
+    │
+    ├─ new FlockMutex($valid_resource, 2)  ← FlockMutex 拿到了真实文件句柄
+    │
+    └─ BookmarkFileService 构造 → 正常完成
+           │
+           ▼
+首次调用 BookmarkIO::write()
+    │
+    ├─ $this->synchronized($callback)
+    │     │
+    │     └─ $this->mutex->synchronized($callback)
+    │           │
+    │           ├─ flock($valid_resource, LOCK_EX)
+    │           │     │
+    │           │     └─ SELinux 拒绝系统调用
+    │           │        → flock() 返回 false
+    │           │        → PHP Warning: flock(): unable to lock file
+    │           │        → 审计日志记录 AVC 拒绝
+    │           │
+    │           └─ malkusch/lock 检测到 flock 返回 false
+    │              → 2 秒内重试（可配置超时）
+    │              → 超时后 → 抛出 LockAcquireException
+    │
+    └─ BookmarkIO::synchronized() 捕获 LockAcquireException
+          │
+          └─ 直接执行 $callback → 无锁降级执行
+```
+
+**与 fopen=false 的关键区别**：
+- fopen=false：FlockMutex 构造时就拿到 false，**第一次 flock 调用会立即失败**（flock(false) 报错）
+- SELinux 拒绝：FlockMutex 构造时拿到有效 resource，**flock 尝试真实执行**，会经历 2 秒的重试等待后才抛异常
+
+这意味着 SELinux 限制下的**每次文件写入都会多等 2 秒**（超时时间），对用户体验影响更大。
+
+### 21.3 2 秒超时重试期间的行为
+
+malkusch/lock 的 FlockMutex 在内部会循环重试 flock，直到超过 2 秒超时：
+
+```
+时序（SELinux 拒绝场景）：
+
+T0: synchronized() 被调用
+T1: flock($fh, LOCK_EX) → false (SELinux denied)
+T2: usleep(100ms)
+T3: flock($fh, LOCK_EX) → false (SELinux denied)
+T4: usleep(100ms)
+    ... (循环约 20 次，共 2 秒)
+T20:最后一次 flock 尝试 → false
+T21:抛出 LockAcquireException
+T22:BookmarkIO::synchronized() 捕获
+T23:无锁执行 callback
+```
+
+总耗时约 2 秒。如果有**多个并发请求**，每个请求都会独立经历这 2 秒超时，最终都降级为无锁执行，实际上**扩大了并发窗口**（因为每个请求都等了 2 秒，让更多请求有机会进入写路径）。
+
+### 21.4 升级流程在 SELinux 限制下的表现
+
+升级涉及多次 datastore 和 config 写入，每次都会触发：
+
+```
+runUpdates()
+  │
+  ├─ updater->update()
+  │     │
+  │     ├─ updateMethodConfigToJson
+  │     │     └─ conf->write() → 无锁（2s 超时降级）
+  │     │
+  │     ├─ updateMethodDatastoreIds
+  │     │     └─ linkDB->save() → 无锁（2s 超时降级）
+  │     │
+  │     ├─ updateMethodMigrateDatabase
+  │     │     └─ BookmarkIO->write() → 无锁（2s 超时降级）
+  │     │
+  │     └─ ...
+  │
+  └─ writeUpdatesFile()
+        └─ 本来就无锁
+```
+
+**总耗时估算**：每个写操作 2 秒超时，如果有 N 个迁移方法涉及写入，总耗时 ≈ 2N 秒。例如 3 个写入方法 → 6 秒。如果 PHP `max_execution_time` 配置为 30 秒，这个延时还能忍受；但如果是 5 秒，则会导致 PHP 执行超时中断，与第十八章分析的半截文件场景叠加。
+
+### 21.5 检测与排查方法
+
+判断是否因 SELinux/AppArmor 导致锁失效：
+
+```bash
+# 方法 1：检查 SELinux 状态
+getenforce
+# 输出 Enforcing → SELinux 强制模式下可能拒绝
+# 输出 Permissive → SELinux 只记录不拒绝
+# 输出 Disabled → 无影响
+
+# 方法 2：查看审计日志
+ausearch -m avc -ts recent | grep init.php
+# 或
+grep "flock\|lock" /var/log/audit/audit.log | tail -20
+
+# 方法 3：检查 AppArmor 日志
+grep "DENIED" /var/log/syslog | grep php
+aa-status   # 查看 AppArmor 状态和加载的配置文件
+
+# 方法 4：临时切换 SELinux 为 Permissive 验证
+setenforce 0
+# 重试升级，如果速度变快且不报错 → 确认是 SELinux 问题
+
+# 方法 5：正确的修复方式（而非关闭 SELinux）
+# 为 init.php 设置正确的 SELinux 上下文：
+semanage fcontext -a -t httpd_sys_rw_content_t /var/www/shaarli/init.php
+restorecon -v /var/www/shaarli/init.php
+# 或者允许 HTTPD 进程加锁：
+setsebool -P httpd_unified 1
+```
+
+### 21.6 与 fopen=false 场景的后果对比表
+
+| 对比项 | fopen 返回 false | SELinux/AppArmor 拒绝 flock |
+|--------|------------------|------------------------------|
+| FlockMutex 构造时状态 | 存储 false | 存储有效 resource |
+| 异常抛出时机 | 第一次 synchronized() 立即 | 2 秒超时后 |
+| 每次写操作的额外耗时 | <1ms（立即降级） | ≈2000ms（超时等待） |
+| 升级总耗时影响 | 可忽略 | 每个写操作 +2 秒 |
+| 是否可能触发 PHP max_execution_time | 否 | 可能（写操作多时超时中断 → 半截文件） |
+| 审计日志 | 无记录 | AVC / DENIED 记录 |
+| 降级后的并发行为 | 一致（都是无锁） | 一致（都是无锁） |
+| 误触发半截文件概率 | 低 | **高**（超时导致执行超时中断） |
+
+---
+
+## 二十二、解压乱码后对象层产生的内存错误链路
+
+### 22.1 解压乱码的三种来源
+
+datastore 解压乱码（gzinflate 返回非预期数据）的典型触发场景：
+
+| 来源 | 具体表现 | gzinflate 行为 |
+|------|----------|----------------|
+| datastore 文件物理损坏 | 位翻转、磁盘坏块、截断 | 返回 false 或部分乱码二进制 |
+| base64 解码时字符集问题 | 文件包含非法 base64 字符 | base64_decode 返回 false 或不完整二进制 |
+| gzip 数据 CRC 校验失败 | 数据在传输/存储中被篡改 | gzinflate 返回 false 或 PHP Warning |
+| 版本不兼容的序列化数据 | 跨版本 unserialize 产生乱码对象 | gzinflate 成功但 unserialize 返回错误类型 |
+| 恶意构造的压缩炸弹 | gzinflate 解压后产出 GB 级数据 | 内存耗尽 → PHP Fatal error |
+
+### 22.2 完整错误传播链路
+
+从文件读取到对象层内存错误的六级链路：
+
+```
+第 1 层：文件 I/O
+  file_get_contents(datastore.php)
+    │
+    └─ 成功 → $content = 完整或半截文件内容
+
+第 2 层：PHP 包裹剥离
+  substr($content, 9, -6)
+    │
+    ├─ 文件过短 → 返回 false 或空字符串
+    └─ 正常 → 提取 base64 payload
+
+第 3 层：Base64 解码
+  base64_decode($payload, true)  ← 注意第二个参数 true 要求严格模式
+    │
+    ├─ 含非法字符 → 返回 false + PHP Warning
+    └─ 正常 → 二进制压缩数据
+
+第 4 层：GZIP 解压（最容易出内存问题的一层）
+  gzinflate($binary)
+    │
+    ├─ 数据损坏 → false + Warning
+    ├─ 压缩炸弹 → 解压出数 GB 数据 → 内存耗尽
+    │   → PHP Fatal error:  Allowed memory size of XXX bytes exhausted
+    │   → 进程立即终止，不执行后续代码
+    │   → file_put_contents 可能未完成 → 半截文件
+    │
+    └─ 正常 → 序列化字符串
+
+第 5 层：PHP 反序列化
+  unserialize($inflated)
+    │
+    ├─ 数据格式错误 → false + Warning
+    ├─ 对象类不存在 → __PHP_Incomplete_Class 对象
+    │   → 后续 instanceof BookmarkArray → false
+    │   → 触发 migrate() 路径
+    │   → LegacyLinkDB 尝试再次读取 → 同样得到 __PHP_Incomplete_Class
+    │   → foreach 遍历 __PHP_Incomplete_Class 失败 → PHP Warning
+    │
+    ├─ 属性类型错误 → 对象构造失败
+    │   → 如 DateTime 属性被反序列化为字符串
+    │   → 后续访问 $bookmark->getCreated()->format()
+    │   → Fatal error: Call to a member function format() on string
+    │
+    └─ 正常 → BookmarkArray 或 array
+
+第 6 层：对象层操作
+  instanceof 检查 / BookmarkFilter / reorder 等
+    │
+    ├─ instanceof BookmarkArray → false（得到 array 或其他对象）
+    │   → migrate() 路径 → LegacyUpdater
+    │
+    ├─ 对象属性不完整
+    │   → 访问不存在的属性 → Undefined property Notice
+    │   → Bookmark::validate() 检查 id/shortUrl/created → InvalidBookmarkException
+    │
+    ├─ DateTime 属性被反序列化为错误类型
+    │   -> Fatal error: Uncaught Error: Call to a member function format() on bool
+    │
+    └─ 正常 → 无错误
+```
+
+### 22.3 压缩炸弹（Zip Bomb）的内存破坏路径
+
+这是最危险的解压乱码场景。`gzinflate()` 对输入数据不做内存上限检查：
+
+```
+恶意构造的输入：
+  极小的 gzip 压缩数据（几百字节）
+  解压后产出 > 2 GB 的序列化字符串
+
+执行路径：
+  T1: gzinflate($payload) → 开始分配内存
+  T2: memory_limit = 128M → 分配到 128MB 时
+  T3: PHP Fatal error: Allowed memory size of 134217728 bytes exhausted
+  T4: 进程立即终止（register_shutdown_function 可能执行但不可靠）
+  T5: 如果此时正处于 write() 的 synchronized 回调中
+      → file_put_contents 未执行或只执行了一部分
+      → 半截文件 → 触发第十八章的空数据覆盖风险
+```
+
+Shaarli 代码中**没有对 gzinflate 输出大小做任何限制**，也没有 `ini_set('memory_limit')` 的临时提升或保护。
+
+### 22.4 反序列化失败后的分支走向
+
+[BookmarkIO::read()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkIO.php#L75-L104) 对 unserialize 返回值的处理：
+
+```php
+$links = unserialize(gzinflate(base64_decode(...)));
+
+if (empty($links)) {
+    if (filesize($this->datastore) > 100) {
+        throw new NotWritableDataStoreException($this->datastore);
+    }
+    throw new EmptyDataStoreException();
+}
+
+return $links;
+```
+
+**反序列化不同失败结果的分支走向**：
+
+| unserialize 返回值 | empty() | filesize > 100 | 抛出异常 | 后续行为 |
+|-------------------|---------|---------------|----------|----------|
+| `false` | true | >100 | NotWritableDataStoreException | 500 错误页 |
+| `false` | true | <100 | EmptyDataStoreException | 初始化空 BookmarkArray → save() 覆盖 |
+| `null` | true | — | 同上 | 同上 |
+| `0` / `""` / `[]` | true | — | 同上 | 同上 |
+| `__PHP_Incomplete_Class` 对象 | false（对象非空） | — | — | 返回该对象 → instanceof BookmarkArray → false → migrate() |
+| `stdClass` 对象 | false | — | — | 返回该对象 → instanceof BookmarkArray → false → migrate() |
+| `array`（遗留格式） | false（非空数组） | — | — | 返回数组 → instanceof BookmarkArray → false → migrate() |
+| `BookmarkArray`（正常） | false（非空或空对象） | — | — | 返回对象 → instanceof 通过 |
+
+### 22.5 __PHP_Incomplete_Class 进入 migrate() 的二次损坏
+
+最危险的一种乱码是：文件格式完好但 serialize 数据引用了不存在的类，产生 `__PHP_Incomplete_Class` 对象。
+
+后果链：
+
+```
+1. unserialize() 返回 __PHP_Incomplete_Class 对象
+2. empty(object) → false
+3. 返回给 BookmarkFileService
+4. !instanceof BookmarkArray → true
+5. 调用 migrate()
+6. LegacyUpdater 实例化 LegacyLinkDB
+7. LegacyLinkDB 再次读取同一个 datastore.php → 同样得到 __PHP_Incomplete_Class
+8. LegacyLinkDB 构造函数中 foreach($this->links as $key => &$link)
+   → __PHP_Incomplete_Class 实现了 Iterator 吗？
+   → PHP 7+ 下会触发 Warning: Invalid argument supplied for foreach()
+   → 返回空数据
+9. LegacyUpdater 操作空数据
+10. linkDB->save() → 把空数据写回 datastore.php
+11. ❗ 原始乱码但可修复的文件被空数据覆盖
+```
+
+这是一条**隐蔽的二次损坏路径**：乱码数据不是直接被判为空，而是先被判为「非 BookmarkArray 的对象」→ 触发遗留迁移 → 迁移中再次失败 → 空数据覆盖。
+
+### 22.6 Bookmark 对象内部 DateTime 属性的类型错误
+
+如果乱码导致 Bookmark 对象的 `$created` 属性从 DateTime 变成了字符串或布尔值：
+
+```php
+// Bookmark 正常使用时
+$bookmark->getCreated()->format('Y-m-d');
+
+// 如果 $created 被反序列化为 false
+// → Fatal error: Uncaught Error: Call to a member function format() on bool
+// → 进程立即终止
+// → 此时如果有写操作未完成 → 半截文件
+```
+
+这类错误属于 **E_ERROR / Fatal error**，不能被 try/catch 捕获（PHP 7+ 下 Error 实现了 Throwable 可以被捕获，但 Shaarli 的中间件只捕获 UnauthorizedException，其他异常走 ErrorController，但 Fatal error 在触发 autoload 前可能已终止）。
+
+---
+
+## 二十三、浏览器缓存与旧状态请求：Cache-Control、PageCache 和升级状态一致性
+
+### 23.1 三层缓存架构
+
+Shaarli 的响应缓存分为三层，需要在升级时确保全部失效：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Layer 1: HTTP 协议级缓存头（init.php 全局设置）          │
+│  Cache-Control: no-store, no-cache, must-revalidate     │
+│  Pragma: no-cache                                        │
+│  Last-Modified: 当前时间                                  │
+├─────────────────────────────────────────────────────────┤
+│  Layer 2: 服务端页面缓存 PageCacheManager                │
+│  data/pagecache/sha1(url).cache 文件                     │
+│  主要缓存 RSS/ATOM Feed 和 Daily 页面                    │
+├─────────────────────────────────────────────────────────┤
+│  Layer 3: RainTPL 模板缓存                               │
+│  tmp/rain-tpl-cache/ 下编译后的 PHP 模板                 │
+│  每次请求都检查模板文件更新时间                           │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 23.2 HTTP 缓存头的全局设置
+
+[init.php#L82-L86](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/init.php#L82-L86) 在每次请求开始时发送严格的禁用缓存头：
+
+```php
+header("Last-Modified: " . gmdate("D, d M Y H:i:s") . " GMT");
+header("Cache-Control: no-store, no-cache, must-revalidate");
+header("Cache-Control: post-check=0, pre-check=0", false);
+header("Pragma: no-cache");
+```
+
+**各项含义**：
+- `no-store`：浏览器和任何中间代理**都不得存储**响应的任何部分
+- `no-cache`：可以存储但**使用前必须向服务器验证**（即强制发送 If-Modified-Since）
+- `must-revalidate`：缓存过期后**必须向服务器验证**，不能直接使用过期副本
+- `post-check=0, pre-check=0`：IE 专用的缓存控制扩展，同样禁用缓存
+- `Pragma: no-cache`：HTTP/1.0 兼容
+
+这些头的设置意味着：**理论上浏览器不会缓存任何 Shaarli 页面**。每次访问都会重新请求服务器。
+
+### 23.3 Service Worker 存在性确认
+
+代码库全局搜索无 Service Worker 相关引用（无 `navigator.serviceWorker.register`、无 `sw.js` 文件、无 Service Worker 相关 HTML 标签）。
+
+**结论**：Shaarli 不使用 Service Worker 进行离线缓存。升级期间的缓存一致性问题**不涉及 SW 层面**，仅需考虑浏览器标准 HTTP 缓存和服务端 PageCache。
+
+### 23.4 服务端 PageCache 的工作机制
+
+[PageCacheManager](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/render/PageCacheManager.php) 管理基于文件的页面缓存：
+
+**写入路径**（以 Feed 为例，[FeedController.php#L54](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/front/controller/visitor/FeedController.php#L54)）：
+```php
+$cache = $this->container->pageCacheManager->getCachePage($pageUrl);
+// ... 生成 RSS 内容 $content ...
+$cache->cache($content);  // file_put_contents(data/pagecache/sha1(url).cache, $content)
+```
+
+**读取路径**（[CachedPage::cachedVersion()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/feed/CachedPage.php#L48-L67)）：
+```php
+public function cachedVersion()
+{
+    if (!$this->shouldBeCached) return null;       // 登录用户不缓存
+    if (!is_file($this->filename)) return null;    // 缓存文件不存在
+    // ... DatePeriod 有效期检查 ...
+    return file_get_contents($this->filename);     // 返回缓存内容
+}
+```
+
+关键设计：**已登录用户（`isLoggedIn=true`）的请求完全不使用 PageCache**，只有匿名访客会命中缓存。
+
+### 23.5 升级时的缓存失效路径
+
+[ShaarliMiddleware::runUpdates()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/front/ShaarliMiddleware.php#L74-L82) 在升级成功后：
+
+```php
+if (!empty($newUpdates)) {
+    $this->container->updater->writeUpdates(...);
+    $this->container->pageCacheManager->invalidateCaches();  // ← 清除服务端缓存
+}
+```
+
+`invalidateCaches()` 最终调用 `purgeCachedPages()`：
+```php
+array_map('unlink', glob($this->pageCacheDir . '/*.cache'));  // 删除所有 .cache 文件
+```
+
+**缓存失效的覆盖范围**：
+
+| 缓存层 | 升级时是否自动失效 | 失效方式 |
+|--------|-------------------|----------|
+| HTTP 浏览器缓存 | ✅ 是（设计上） | no-store/no-cache 头本身阻止缓存 |
+| 服务端 PageCache (.cache 文件) | ✅ 是 | invalidateCaches() 删除 |
+| RainTPL 模板编译缓存 | ❌ **否** | 依赖文件 mtime 自动检测 |
+
+### 23.6 实际场景中的缓存不一致风险
+
+虽然 HTTP 头设置了 no-store，但在以下场景仍可能出现缓存不一致：
+
+#### 场景 1：用户在升级前已打开页面
+
+```
+T0: 用户浏览器打开 Shaarli 首页（已登录）
+T1: 管理员在服务器上替换代码 + 复制备份
+T2: 用户浏览器 Tab 未关闭，JavaScript 轮询或用户点击链接
+T3: 由于浏览器设置了 no-cache，会发送请求
+     → 但用户 Cookie 中的 session 仍有效
+     → ShaarliMiddleware::runUpdates() 执行
+     → 检测到数据格式是旧的 → 触发 migrate()
+     → exit("Please reload")
+T4: 用户看到纯文本提示
+```
+
+这种情况下**不会显示旧内容**，因为每次请求都会回到服务器。
+
+#### 场景 2：升级期间匿名访客访问 Feed
+
+```
+T0: 管理员开始升级（替换代码中）
+T1: 匿名访客请求 /feed/atom
+T2: 旧代码（部分文件未替换完）生成 RSS → 写入 PageCache
+T3: 代码替换完成 + 升级执行 + invalidateCaches() → 删除 .cache
+T4: 缓存被清除，新请求生成新格式 Feed → 正常
+```
+
+这种场景无缓存残留，因为 invalidateCaches() 在升级最后执行。
+
+#### 场景 3：HTTP 代理/CDN 缓存
+
+如果用户在 Shaarli 前面部署了 Varnish、Cloudflare 等反向代理缓存：
+- 即使 Shaarli 发送了 no-cache，代理配置可能忽略这些头并自行缓存
+- 升级后旧的响应可能被代理继续提供给访客
+- **需要在代理层面额外执行缓存清除**
+
+### 23.7 RainTPL 模板缓存的版本一致性
+
+RainTPL 编译模板到 `tmp/rain-tpl-cache/*.rain.php`。它的缓存校验机制是**比较模板文件 mtime**：如果模板文件的修改时间晚于编译缓存文件，就重新编译。
+
+升级时替换了模板文件（tpl/ 目录），文件 mtime 更新 → RainTPL 自动检测并重新编译。**这层不需要手动清除**。
+
+但如果升级时用 `cp -a`（保留时间戳）复制模板文件，mtime 可能不变 → RainTPL 认为缓存有效 → 旧模板与新代码不兼容 → 模板报错。此时需要手动删除 tmp/rain-tpl-cache/ 下所有文件。
+
+---
+
+## 二十四、插件元数据与代码的版本兼容性：降级加载实现
+
+### 24.1 插件系统的四层结构
+
+每个 Shaarli 插件由四层文件组成，每层在跨版本时的兼容性风险不同：
+
+```
+plugins/<plugin_name>/
+├── <plugin_name>.php     // 主代码文件（含 hook_* 函数）
+├── <plugin_name>.meta    // INI 格式元数据（描述、参数定义）
+├── <plugin_name>.css     // 可选：CSS 样式
+└── <plugin_name>.js      // 可选：JavaScript
+```
+
+元数据示例（[demo_plugin.meta](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/plugins/demo_plugin/demo_plugin.meta)）：
+```ini
+description="A demo plugin covering all use cases..."
+parameters="DEMO_PLUGIN_PARAMETER;DEMO_PLUGIN_OTHER_PARAMETER"
+parameter.DEMO_PLUGIN_PARAMETER="This is a parameter..."
+parameter.DEMO_PLUGIN_OTHER_PARAMETER="Other demo parameter"
+```
+
+### 24.2 插件加载的完整流程与错误容忍
+
+[PluginManager::load()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/plugin/PluginManager.php#L84-L107) 的容错设计：
+
+```
+load($authorizedPlugins)
+    │
+    ├─ glob(plugins/*, GLOB_ONLYDIR) 扫描插件目录
+    │
+    ├─ 遍历 authorizedPlugins 中每个配置启用的插件名
+    │     │
+    │     ├─ array_search 检查目录是否存在
+    │     │   └─ 不存在 → continue（静默跳过）
+    │     │
+    │     └─ loadPlugin($dir, $pluginName)
+    │           │
+    │           ├─ 目录不存在 → PluginFileNotFoundException
+    │           │   → catch → error_log → continue
+    │           │
+    │           ├─ <plugin>.php 不存在 → PluginFileNotFoundException
+    │           │   → catch → error_log → continue
+    │           │
+    │           ├─ include_once <plugin>.php
+    │           │   └─ 任何 Throwable（语法错误、类不存在、依赖缺失）
+    │           │      → catch，错误消息加入 $this->errors
+    │           │      → 插件不加入 loadedPlugins
+    │           │
+    │           ├─ <plugin>_init() 调用
+    │           │   └─ 任何 Throwable
+    │           │      → catch，错误消息加入 $this->errors
+    │           │
+    │           └─ <plugin>_register_routes() 调用
+    │               └─ PluginInvalidRouteException
+    │                  → 不 catch → 冒泡到上层
+    │
+    └─ 全部完成，不抛异常（单个插件失败不影响整体）
+```
+
+**核心设计原则：单个插件失败不影响 Shaarli 主体运行**。即使大部分插件加载失败，核心功能仍可用。
+
+### 24.3 元数据 getPluginsMeta() 的版本兼容处理
+
+[PluginManager::getPluginsMeta()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/plugin/PluginManager.php#L230-L270) 读取 .meta 文件时的容错：
+
+```php
+foreach ($dirs as $pluginDir) {
+    $plugin = basename($pluginDir);
+    $metaFile = $pluginDir . $plugin . '.meta';
+    if (!is_file($metaFile) || !is_readable($metaFile)) {
+        continue;  // ← .meta 文件缺失或不可读 → 静默跳过该插件
+    }
+
+    $metaData[$plugin] = parse_ini_file($metaFile);  // ← parse_ini_file 返回 false 时
+    // ... 后续代码假设 $metaData[$plugin] 是数组
+    // 如果 .meta 文件损坏，parse_ini_file 返回 false
+    // → 后续 $metaData[$plugin]['order'] 触发 Warning: Illegal string offset 'order'
+    // → 但不致命，页面仍能显示
+```
+
+**降级兼容行为**：
+
+| .meta 文件状态 | getPluginsMeta() 行为 | 对用户的影响 |
+|----------------|----------------------|-------------|
+| 文件不存在 | 插件不出现在插件管理页列表中 | 插件仍可能正常工作（.php 正常加载），只是后台看不到配置项 |
+| 文件存在但 parse_ini_file 失败 | 触发 PHP Warning，插件以错误元数据形式出现 | 后台插件列表显示异常，但不影响前端功能 |
+| 参数缺失 `parameters=` 行 | `$params = []`，插件无参数配置 | 可用默认值或直接不配置参数 |
+| 旧版本新增参数未在新版中定义 | 参数被保留在配置中但不被旧版插件代码使用 | 无影响，忽略多余参数 |
+| 新版删除了旧版中存在的参数 | 参数定义不存在但配置中有值 | parse_ini_file 不会报错，参数值被保留但不被使用 |
+
+### 24.4 插件配置的存储与跨版本兼容
+
+插件配置存储在 ConfigManager 的 `plugins.*` 命名空间下：
+
+```json
+{
+  "plugins": {
+    "ENABLED": ["wallabag", "qrcode"],
+    "WALLABAG_URL": "https://wallabag.example.com",
+    "PIWIK_URL": "https://piwik.example.com"
+  }
+}
+```
+
+跨版本时的兼容性：
+
+- **插件已删除但配置仍存在**：配置项保留在 JSON 中，不被任何代码读取 → 占用空间但无影响
+- **新版插件增加新参数**：旧配置中无该参数 → 插件代码需处理 `conf->get()` 返回 null 的情况 → 通常有默认值兜底
+- **旧版插件使用了新版已删除的核心 hook**：`function_exists($hookFunction)` 检查返回 false → hook 不执行 → 插件功能降级但不报错
+- **新版插件的 init() 依赖新版核心 API**：init() 抛出异常 → 被 catch → 插件不加载 → 错误消息记录在 `$this->errors`
+
+### 24.5 新版插件降级到旧版的三种失败模式
+
+| 失败模式 | 触发条件 | 用户可见表现 | 数据影响 |
+|----------|----------|-------------|----------|
+| **模式 1：静默不加载** | 新版插件使用了旧版不存在的 hook 名称、或依赖旧版没有的核心类 | 插件不工作，后台插件列表可能不显示 | 配置保留，不损坏 |
+| **模式 2：错误日志记录** | 新版插件的 `_init()` 函数使用了旧版不存在的 API | 页面正常显示，但 error_log 中有异常记录 | 配置保留 |
+| **模式 3：管理页异常** | 新版 .meta 文件含旧版 parse_ini_file 无法解析的语法 | 后台插件管理页显示 PHP Warning | 不影响前端功能 |
+| **模式 4（最严重）：模板/资源引用错误** | 新版插件的 .php 中 render 了旧版不存在的模板文件 | 调用 hook 的页面抛异常 → ErrorController 500 | 可能导致页面无法访问，但核心数据不损坏 |
+
+### 24.6 插件系统的降级恢复步骤
+
+如果升级后因插件不兼容导致页面 500：
+
+```bash
+# 步骤 1：通过配置文件禁用所有插件
+cd data/
+# 编辑 config.json.php，将 plugins.ENABLED 设置为空数组
+# 或直接重命名 plugins 目录
+mv plugins plugins_disabled
+
+# 步骤 2：验证核心功能恢复
+curl -I http://shaarli.example.com/
+# 期望 HTTP 200
+
+# 步骤 3：逐个启用插件，定位不兼容的插件
+# 在 plugins_disabled 中逐个移回 plugins/ 目录
+# 每移动一个测试一次页面访问
+
+# 步骤 4：对不兼容插件降级处理
+# - 检查插件目录是否有旧版本可用
+# - 或修改 <plugin>_init() 中的新版 API 调用为旧版等价
+# - 或在 plugin 代码中添加版本检查
+
+# 步骤 5：检查 PluginManager 错误
+# 在浏览器开发者模式或页面 HTML 源码中查找
+# "plugin incompatibility" 字样的错误消息
+```
+
+### 24.7 插件 hook 执行的防御性设计
+
+[PluginManager::executeHooks()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/plugin/PluginManager.php#L118-L150) 的容错确保单个插件 hook 失败不影响其他插件：
+
+```php
+foreach ($this->loadedPlugins as $plugin) {
+    $hookFunction = $this->buildHookName($hook, $plugin);
+
+    if (function_exists($hookFunction)) {
+        try {
+            $data = call_user_func($hookFunction, $data, $this->conf);
+        } catch (\Throwable $e) {
+            // 单个插件 hook 异常 → 记录错误，继续执行下一个插件
+            $error = $plugin . t(' [plugin incompatibility]: ') . $e->getMessage();
+            $this->errors = array_unique(array_merge($this->errors, [$error]));
+        }
+    }
+    // 函数不存在 → 静默跳过，不报错
+}
+```
+
+这意味着：即使有 9 个插件正常、1 个插件 hook 抛异常，**数据仍会被正确传递**给后续插件，不会中断整个 hook 链。
