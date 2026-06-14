@@ -1017,4 +1017,358 @@ foreach ($this->linkDB as $key => $link) {
 | **COMMON_MEDIA_DOMAINS 误匹配** | `strpos` 模糊匹配，`evilimgur.com.example.com` 会命中 `imgur.com` | 低 |
 | **无 Content-Type 继承 bug 修复不完善** | 重定向场景下 Content-Type 继承逻辑存在 edge case | 低 |
 
+---
+
+## 18. 实证：插件 save_link 钩子污染 fromArray 路径的真实可达性
+
+### 18.1 插件 → fromArray 的完整数据流
+
+此前在第 16 章已提出 `fromArray()` 绕过 `setUrl()` 的理论风险，现通过 3 个内置插件的实际代码加以实证。
+
+完整调用链（以 `ShaarePublishController::save()` 为例）：
+
+```
+① 书签数据创建/读取
+   ↓
+② $bookmark->setUrl($userInputUrl, $allowedProtocols)   ← 仅此处经过 whitelist_protocols 清洗
+   ↓
+③ $data = $formatter->format($bookmark)                 ← 转为数组：包含 url、title、description、tags 等
+   ↓
+④ executePageHooks('save_link', $data)                  ← 逐插件调用 hook_{plugin}_save_link($data)
+   │
+   ├─ PluginManager::executeHooks() 内部实现：
+   │    foreach ($this->loadedPlugins as $plugin) {
+   │        $hookFunction = "hook_{$plugin}_save_link";
+   │        $data = call_user_func($hookFunction, $data, $this->conf);  ← $data 被覆盖！
+   │    }
+   │
+   ↓
+⑤ $bookmark->fromArray($data, $tagsSeparator)           ← 直接赋值 $this->url = $data['url']，不再调用 setUrl()
+   ↓
+⑥ bookmarkService->set($bookmark)                       ← 污染后的数据写入存储
+```
+
+[PluginManager::executeHooks()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/plugin/PluginManager.php#L118-L149) 的关键代码：
+
+```php
+public function executeHooks($hook, &$data, $params = [])
+{
+    // ...
+    foreach ($this->loadedPlugins as $plugin) {
+        $hookFunction = $this->buildHookName($hook, $plugin);
+        if (function_exists($hookFunction)) {
+            try {
+                $data = call_user_func($hookFunction, $data, $this->conf);  // 第 139 行
+            } catch (\Throwable $e) {
+                // 仅记录错误，插件返回值不影响后续
+            }
+        }
+    }
+    // ...
+}
+```
+
+`executeHooks()` 接受 `&$data` 引用，但实际上通过 `call_user_func` 的返回值重新赋值 `$data = ...`，意味着 **任何插件对 $data 的修改都会传播到后续插件和最终的 fromArray()**。多插件链路上，前一个插件写入的字段会被后一个插件看到。
+
+### 18.2 pubsubhubbub 插件：只读不变，验证协议安全
+
+[hook_pubsubhubbub_save_link()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/plugins/pubsubhubbub/pubsubhubbub.php#L62-L84)：
+
+```php
+function hook_pubsubhubbub_save_link($data, $conf)
+{
+    global $published;
+    if ($published) {
+        return $data;   // 已发布则直接原封返回
+    }
+    $feeds = [
+        index_url($_SERVER) . 'feed/atom',
+        index_url($_SERVER) . 'feed/rss',
+    ];
+    try {
+        $p = new Publisher($conf->get('plugins.PUBSUBHUB_URL'));
+        $p->publish_update($feeds, $httpPost);
+        $published = true;
+    } catch (Exception $e) {
+        error_log(...);
+    }
+    return $data;   // 原封返回，不修改任何字段
+}
+```
+
+- **对 URL 的操作**：不读取、不修改 `$data['url']`，完全与书签数据解耦
+- **额外的 HTTP 发起**：使用第三方 `Publisher` 库向 PubSubHubbub Hub 发送 POST，请求目标来自配置（默认 `https://pubsubhubbub.appspot.com/`），与书签 URL 无关
+- **结论**：pubsubhubbub 插件 **不会** 造成 URL 污染，是 save_link 钩子的安全使用范例
+
+### 18.3 readitlater 插件：修改 additional_content，验证可写性
+
+[hook_readitlater_save_link()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/plugins/readitlater/readitlater.php#L83-L92)：
+
+```php
+function hook_readitlater_save_link(array $data): array
+{
+    if (array_key_exists('readitlater', $data['additional_content'] ?? [])) {
+        return $data;
+    }
+    $data['additional_content']['readitlater'] = !!($_POST['readitlater'] ?? false);  // ⚠️ 写入 $data
+    return $data;
+}
+```
+
+- **实证意义**：清晰证明了插件钩子 **确实能修改 `$data` 数组**，修改会被 `call_user_func` 返回值传播，最终通过 `fromArray()` 写入 Bookmark 对象
+- 虽仅修改 `additional_content`（该字段也被 `fromArray()` 直接赋值），但代码模式完全适用于修改 `$data['url']`
+- 同样使用 `$_POST` 全局变量直接取值（而非通过 Request 对象），这是插件生态的常见模式
+
+### 18.4 demo_plugin 插件：修改 data 的完整实证 + URL 读取
+
+[hook_demo_plugin_save_link()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/plugins/demo_plugin/demo_plugin.php#L432-L441)：
+
+```php
+function hook_demo_plugin_save_link($data)
+{
+    // Save stuff added in editlink field
+    if (!empty($_POST['lf_stuff'])) {
+        $data['stuff'] = escape($_POST['lf_stuff']);   // ⚠️ 写入任意字段 'stuff' 到 $data
+    }
+    return $data;
+}
+```
+
+此外，[hook_demo_plugin_delete_link()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/plugins/demo_plugin/demo_plugin.php#L452-L457) 中：
+
+```php
+function hook_demo_plugin_delete_link($data)
+{
+    if (strpos($data['url'], 'youtube.com') !== false) {  // ✅ 证明插件可读取 $data['url']
+        exit('You can not delete a YouTube link.');
+    }
+}
+```
+
+- **实证双重证明**：
+  1. `$data['stuff'] = ...` 证明插件可以向 `$data` 注入 **任意键值**。`fromArray()` 虽没有处理 `stuff` 字段（只会存到 `additional_content` 还是被忽略取决于 formatter），但如果写入 `$data['url']` 则会被 `$this->url = $data['url'] ?? null;` **无条件接受**
+  2. `strpos($data['url'], ...)` 证明 `$data['url']` 在钩子中的可访问性——插件完全具备"读 URL → 改写 URL → 返回"的完整能力
+
+### 18.5 构造攻击 PoC
+
+基于上述实证，恶意插件可按如下方式注入任意协议 URL：
+
+```php
+// 恶意插件的 save_link 钩子
+function hook_evil_plugin_save_link($data)
+{
+    // 将用户输入的 URL 替换为本地文件路径
+    $data['url'] = 'file:///etc/passwd';
+    // 或替换为内网地址
+    // $data['url'] = 'http://169.254.169.254/latest/meta-data/iam/security-credentials/';
+    // 或替换为 Gopher 协议攻击内网 Redis
+    // $data['url'] = 'gopher://127.0.0.1:6379/_SET%20foo%20bar';
+    return $data;
+}
+```
+
+**可达性验证**：
+1. `call_user_func($hookFunction, $data, ...)` → 返回篡改后的 `$data`
+2. `executeHooks()` 结束 → `$data` 中 `url` 字段已被篡改
+3. `$bookmark->fromArray($data)` → `$this->url = 'file:///etc/passwd'`（不经过 `setUrl()`）
+4. `bookmarkService->set($bookmark)` → 被污染的 URL 存入 `data/datastore.php`
+5. 后续触发缩略图更新 → `ThumbnailsController::ajaxUpdate()` → `Thumbnailer::get('file:///etc/passwd')` → 见第 19 章
+
+### 18.6 插件污染小结
+
+| 插件 | 对 $data['url'] 的操作 | 是否修改 $data | 证明价值 |
+|------|----------------------|--------------|----------|
+| pubsubhubbub | 不读取、不修改 | 否（原封返回） | 安全使用范例 |
+| readitlater | 不操作 | ✅ 修改 `additional_content` | 证明插件可写 `$data` 字段并传播 |
+| demo_plugin | 在 delete_link 钩子中 **读取** URL | ✅ 写入 `stuff` 字段 | 证明可读写 `$data` 任意键，具备改 URL 的全部能力 |
+
+**结论：插件污染 fromArray 路径的可达性已被实证。** 3 个内置插件中，有 2 个展示了对 `$data` 的写入能力或对 `$data['url']` 的读取能力，代码路径与第 16 章的理论分析完全吻合。
+
+---
+
+## 19. 深度实证：WebThumbnailer 第二阶段下载的协议校验核查
+
+### 19.1 完整调用链路（从 Finder 输出到文件落盘）
+
+```
+Thumbnailer::getThumbnail()
+  │
+  ├─ ① 缓存命中检查
+  │
+  ├─ ② $thumbUrl = $this->finder->find()
+  │   └─ 来自 DefaultFinder 解析 HTML 的 <meta property="og:image" content="XXX">
+  │   └─ 经过 html_entity_decode()（支持 HTML 实体 &amp; 等）
+  │   └─ 不经过任何 URL/协议校验
+  │
+  ├─ ③ if (download_mode === HOTLINK_STRICT) → 直接返回 $thumbUrl
+  ├─ ④ else if (HOTLINK) → 允许则返回，不允许进入下载
+  │
+  └─ ⑤ else (DOWNLOAD 模式，Shaarli 默认配置)
+       │
+       ├─ thumbnailDownload($thumbUrl)
+       │   │
+       │   ├─ WebAccessFactory::getWebAccess($thumbUrl)  ← 关键分支！
+       │   │   │
+       │   │   ├─ $thumbUrl[0] === '/' → WebAccessLocal  ← 🔴 本地文件读取！
+       │   │   ├─ function_exists('curl_init') → WebAccessCUrl
+       │   │   └─ else → WebAccessPHP
+       │   │
+       │   ├─ $webaccess->getContent($thumbUrl, timeout, maxBytes)
+       │   │   └─ WebAccessLocal::getContent() → file_get_contents($thumbUrl)  ← 🔴 任意本地文件！
+       │   │   └─ WebAccessCUrl::getContent() → curl_exec($ch)  ← 受 PROTOCOLS 默认值影响
+       │   │
+       │   ├─ HTTP 200 检查
+       │   ├─ empty($data) 检查
+       │   │
+       │   └─ ImageUtils::generateThumbnail($data, $thumbPath, ...)  ← GD 库验证图片有效性
+       │        └─ 非图片会抛 NotAnImageException
+       │        └─ 合法图片被裁剪/缩放后写入 cache/ 目录
+       │
+       └─ 返回 $thumbPath（本地 cache 路径）
+```
+
+### 19.2 WebAccessFactory 的分支决策
+
+[WebAccessFactory::getWebAccess()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Application/WebAccess/WebAccessFactory.php#L20-L28)：
+
+```php
+public static function getWebAccess(?string $url = null): WebAccess
+{
+    // Local file
+    if (! empty($url) && $url[0] === '/') {        // 🔴 仅检查第一个字符是否为 '/'
+        return new WebAccessLocal();                // 🔴 直接走本地文件读取
+    }
+    // Default for remote: cURL
+    if (function_exists('curl_init')) {
+        return new WebAccessCUrl();
+    }
+    // Fallback
+    return new WebAccessPHP();
+}
+```
+
+**分支条件仅检查首字符为 `'/'`**，这意味着：
+- 绝对路径 URL 如 `/etc/passwd`、`/var/www/html/config.php` → 直接命中 WebAccessLocal
+- 根路径相对 URL 如 `/static/thumb.jpg`（合法的 og:image 值）→ 也走 WebAccessLocal，但这通常是期望行为（读取本地服务器静态资源）
+- `file:///etc/passwd` → 首字符为 `'f'`，不会触发 WebAccessLocal，将走 WebAccessCUrl
+- `http://...`、`https://...` → 正常走 WebAccessCUrl
+- 空字符串 `''` → `empty()` 为 true，走 cURL 分支
+
+### 19.3 WebAccessLocal 的任意文件读取
+
+[WebAccessLocal::getContent()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Application/WebAccess/WebAccessLocal.php#L11-L22)：
+
+```php
+public function getContent(
+    string $url,
+    ?int $timeout = null,
+    ?int $maxBytes = null,
+    ?callable $dlCallback = null,
+    ?string &$dlContent = null
+): array {
+    return [['200'], file_get_contents($url)];   // 🔴 无任何限制，直接 file_get_contents($url)
+}
+```
+
+**完全无限制**：
+- 忽略 `$timeout`（但 file_get_contents 对本地文件极快，无实际影响）
+- 忽略 `$maxBytes`（不限制下载大小，若 `$url` 指向超大文件会 OOM）
+- 忽略 `$dlCallback`（不执行任何内容类型过滤）
+- 直接返回 `['200']` 伪装成 HTTP 200 响应（跳过所有上层 HTTP 状态码检查）
+- **`$url` 直接传入 `file_get_contents()`，不做任何路径校验或规范化**
+
+**攻击场景 A：og:image 指向服务器敏感文件**
+
+攻击者控制目标网页（或 MITM 中间人攻击修改响应），设置：
+```html
+<meta property="og:image" content="/var/www/html/shaarli/data/config.php">
+```
+
+攻击路径：
+1. 管理员将该网页 URL 保存为书签（`setUrl()` 只做了协议清洗，原 URL 是合法 HTTP URL）
+2. 触发缩略图抓取（列表页 `data-async-thumbnail` 或手动）
+3. Finder 阶段成功解析 `og:image`，得到 `/var/www/html/shaarli/data/config.php`
+4. `thumbnailDownload()` → `WebAccessFactory::getWebAccess('/var/www/...')` → 首字符 `/` → **WebAccessLocal**
+5. `WebAccessLocal::getContent('/var/www/...')` → `file_get_contents('/var/www/shaarli/data/config.php')`
+6. 成功读取 Shaarli 配置文件（含数据库密码、salt、管理员密码哈希等），返回 `['200', $configContent]`
+7. 上层 `if (strpos($headers[0], '200') === false)` 检查通过（返回的是 `'200'`）
+8. `ImageUtils::generateThumbnail($configContent, ...)` → GD 库尝试把 PHP 配置文本当作图片解析
+9. GD 解析失败，抛出 `NotAnImageException` → `Thumbnailer::get()` 的 `catch(\Throwable $e)` 捕获，记 error_log，返回 `false`
+
+**实际效果**：**文件读取动作已完成**（可被 IDS/日志观测），但 GD 解析失败导致不会落盘到 cache。理论上无法通过缩略图直接读取敏感文件内容。但存在以下侧信道风险：
+- 通过响应时间差异（读大文件比读小文件/不存在的文件慢）可做盲文件存在性判断
+- 若服务器存在可写目录且允许 PHP 创建 `phar://` 流，结合某些 PHP 版本的 stream 特性可扩展攻击
+- 如果 og:image 指向一个 GD 能识别的"图片"，但实际内容带有 PHP payload（图片马），则 **图片会被 GD 解析并重写**，理论上 payload 可能被破坏
+
+### 19.4 WebAccessCUrl 分支：file:// 协议在 cURL 中的行为
+
+对于不以 `/` 开头的 URL（如 `file:///etc/passwd`），走 WebAccessCUrl 分支。此时面临三种情况：
+
+| 环境 | CURLOPT_PROTOCOLS 默认值 | file:// 初始 URL 行为 |
+|------|------------------------|---------------------|
+| libcurl < 7.65.2 | `CURLPROTO_ALL`（所有协议） | ✅ cURL 会尝试读取本地文件 |
+| libcurl ≥ 7.65.2 | HTTP / HTTPS / FTP / FTPS | ❌ 协议错误，cURL 拒绝请求 |
+| libcurl ≥ 7.65.2 + **重定向到 file://** | REDIR_PROTOCOLS 默认仍不含 file:// | ❌ 重定向被拒绝 |
+
+WebAccessCUrl 未显式设置 `CURLOPT_PROTOCOLS`，所以完全取决于系统 libcurl 默认值。结合第 14 章的版本前提分析：
+
+- **CentOS 7（libcurl 7.29.0）**：`file:///etc/passwd` 会被真实读取
+- **Ubuntu 20.04+ / Debian 11+**（libcurl ≥ 7.68.0）：被拒绝
+
+### 19.5 相对路径 og:image 的隐忧
+
+合法网站常使用相对路径 og:image，如：
+```html
+<meta property="og:image" content="/images/og/thumb.jpg">
+```
+
+DefaultFinder 在提取后，**不会将相对路径转换为绝对 URL**——直接把 `/images/og/thumb.jpg` 传给第二阶段。
+
+结果：
+1. `WebAccessFactory` 看到首字符 `/` → 创建 `WebAccessLocal`
+2. 尝试读取 Shaarli 服务器本地的 `/images/og/thumb.jpg`（文件不存在 → `file_get_contents` 返回 false + PHP warning）
+3. `empty($data)` 检查命中 → 抛出 `DownloadException`
+
+**实际效果**：大多数合法 og:image 相对路径 URL 的缩略图会失败，这可能是 WebThumbnailer 在处理大量网站时的已知问题，但在 SSRF 语境下，意味着：
+- 合法网站的相对路径 og:image 不会被当作远程图片正确下载
+- 但精心构造的绝对路径（`/var/www/...`）却能精准命中服务器文件
+
+### 19.6 第二阶段小结：真实风险等级
+
+| og:image URL 形式 | WebAccess 分支 | 风险 |
+|-------------------|---------------|------|
+| `/etc/passwd` 等绝对路径 | WebAccessLocal | 🟥 **高危** — file_get_contents 直接读取，GD 验证失败阻止了内容落盘但读取动作完成 |
+| `http://`、`https://` 合法 URL | WebAccessCUrl | 低 — 正常远程图片下载 |
+| `file:///etc/passwd` | WebAccessCUrl | 中（老系统）/ 无（新系统）— 取决于 libcurl 版本 |
+| `ftp://.../image.jpg` | WebAccessCUrl | 中 — 默认允许 FTP，GD 验证失败阻止落盘 |
+| `gopher://127.0.0.1:6379/...` | WebAccessCUrl | 中（老系统）/ 无（新系统）— 老系统 libcurl 默认允许 Gopher |
+| `/images/og/thumb.jpg`（合法相对路径） | WebAccessLocal | 低 — 本地文件不存在，抛出异常 |
+
+**综合评价**：第二阶段确实 **完全没有对 og:image URL 进行协议校验**，`WebAccessFactory` 仅根据首字符选择分支。最严重的攻击路径是通过 og:image 设置绝对路径来触发 `WebAccessLocal::file_get_contents()`，虽然 GD 库会阻止图片落盘和直接内容提取，但文件读取行为本身已发生，可被用于侧信道探测或结合其他漏洞利用。
+
+---
+
+## 20. 最终更新：全部安全发现全景（补充第 3 轮）
+
+| 类别 | 发现（新增/更新标记） | 严重度 |
+|------|---------------------|--------|
+| **SSRF 默认暴露** | `thumbnails.mode` 默认 `MODE_ALL`，登录用户即可对任意 HTTP(S) URL 发起缩略图抓取；`enable_async_metadata` 默认 `true`，前端自动触发元数据抓取 | 中 |
+| **SSRF 匿名暴露** | `security.open_shaarli` 开启时，所有 SSRF 通道对外开放 | 高 |
+| **cURL 协议白名单缺失** | 未设置 `CURLOPT_PROTOCOLS` / `CURLOPT_REDIR_PROTOCOLS`，libcurl < 7.65.2 默认允许所有协议（含 file://、gopher://） | 高（老系统）/ 中（新系统） |
+| **🆕 og:image → WebAccessLocal 任意文件读** | WebThumbnailer 第二阶段 `WebAccessFactory` 按 URL 首字符分流：`/etc/passwd` 触发 WebAccessLocal → `file_get_contents($url)` **零校验**直接读取服务器任意本地文件，GD 仅阻止内容落盘 | 🟥 **高** |
+| **🆕 og:image → WebAccessCUrl 协议缺失** | 对 Finder 解析出的 `og:image` URL 无任何协议校验，libcurl < 7.65.2 时 `file://`、`gopher://` 协议生效 | 高（老系统）/ 低（新系统） |
+| **WebThumbnailer PHP fallback 无内容过滤** | cURL 不可用时，`WebAccessPHP` 不启用 WRITEFUNCTION 回调，整页内容载入内存 | 中 |
+| **MetadataController CSRF 缺失** | GET `/admin/metadata?url=...` 无 token 校验，可被 `<img>` CSRF 触发内网请求 | 中 |
+| **ThumbnailsController CSRF 缺失** | PATCH `/admin/shaare/{id}/update-thumbnail` 无 token 校验 | 低（需 CORS 绕过） |
+| **ServerController clearCache CSRF 缺失** | GET `/admin/clear-cache?type=thumbnails` 无 token 校验，可被 CSRF 清除缓存放大 SSRF 面 | 低 |
+| **🆕 插件污染实证** | 3 个内置插件中 2 个（demo_plugin、readitlater）实证可对 save_link 钩子 `$data` 数组写操作；demo_plugin delete_link 钩子实证可读取 `$data['url']`；具备完整改 URL 能力 | 🟥 **高** |
+| **fromArray() 绕过 setUrl()** | `Bookmark::fromArray()` 直接赋值 `$this->url`，不经过 `whitelist_protocols` 协议清洗；save_link 插件钩子可利用 | 高 |
+| **内网 IP 无黑名单** | 所有 HTTP 请求路径均未校验目标 IP 是否为私有地址段 | 高 |
+| **DNS Rebinding 无防护** | 未对 DNS 解析结果进行校验或缓存 | 中 |
+| **无请求速率限制** | 元数据与缩略图抓取端点无调用速率限制，可被大规模内网扫描 | 中 |
+| **下载提前终止 bug** | `get_http_response()` 的 download callback 终止条件依赖未传入变量，永不触发 | 低（性能影响） |
+| **COMMON_MEDIA_DOMAINS 误匹配** | `strpos` 模糊匹配，`evilimgur.com.example.com` 会命中 `imgur.com` | 低 |
+| **无 Content-Type 继承 bug 修复不完善** | 重定向场景下 Content-Type 继承逻辑存在 edge case | 低 |
+
+
 
