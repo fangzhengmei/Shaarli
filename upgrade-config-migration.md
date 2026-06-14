@@ -1832,3 +1832,498 @@ Bookmark 对象在不同版本间属性逐步增加：
 | 无版本标记 | 无法判断备份来自哪个版本 | 在 datastore 头部写入版本号 |
 | 属性只增不删但无迁移映射 | 旧备份恢复后缺失属性无补偿 | 在 Bookmark::__unserialize() 中补全默认值 |
 | 备份文件名不含格式标记 | 无法从文件名判断 FORMAT_A/B/C | 命名中加入格式标识，如 `datastore.v2.YYYYMMDDHHmmss.php` |
+
+---
+
+## 十七、锁文件不可用时的完整回落路径：SHAARLI_MUTEX_FILE 异常全链路
+
+### 17.1 SHAARLI_MUTEX_FILE 的定义与作用
+
+[SHAARLI_MUTEX_FILE](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/init.php#L63) 定义在 `init.php` 第 63 行：
+
+```php
+define('SHAARLI_MUTEX_FILE', __FILE__);
+```
+
+它就是 `init.php` 文件自身。所有需要互斥保护的地方都用这个文件作为 flock 的目标：
+
+- [ContainerBuilder.php#L100](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/container/ContainerBuilder.php#L100) - Web 端 bookmarkService
+- [ApiMiddleware.php#L150](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/api/ApiMiddleware.php#L150) - API 端 LinkDb
+- [ApplicationUtils.php#L251](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/helper/ApplicationUtils.php#L251) - 健康检查
+
+使用 `init.php` 自身作为锁文件是巧妙的设计：
+- 保证文件一定存在（代码已经在运行了）
+- 不需要额外创建锁文件
+- 所有进程共享同一个锁目标
+
+### 17.2 fopen(SHAARLI_MUTEX_FILE, 'r') 返回 false 的触发场景
+
+理论上 `init.php` 一定存在且可读（因为 PHP 正在执行它），但以下极端场景会导致 `fopen` 失败：
+
+| 场景 | 原因 | fopen 返回值 |
+|------|------|-------------|
+| `chmod 000 init.php` | 文件权限被意外修改为不可读 | `false` + PHP Warning |
+| `open_basedir` 限制 | PHP 配置禁止访问该路径 | `false` + Warning |
+| 文件句柄耗尽 | 系统文件描述符达到上限 | `false` + Warning |
+| init.php 被删除（运行时） | 极端人为操作 | `false` + Warning |
+| 磁盘 IO 错误 | 硬件故障 | `false` + Warning |
+
+### 17.3 异常传播完整链路
+
+当 `fopen(SHAARLI_MUTEX_FILE, 'r')` 返回 `false` 时，异常传播路径为：
+
+```
+ContainerBuilder 构造 bookmarkService
+    │
+    ├─ new FlockMutex(fopen(SHAARLI_MUTEX_FILE, 'r'), 2)
+    │      │
+    │      └─ fopen 返回 false → FlockMutex 内部保存了 false 作为 file handle
+    │         （构造函数不抛异常，只是保存参数）
+    │
+    └─ BookmarkFileService 构造 → 正常完成（此时还没用到锁）
+           │
+           ▼
+首次调用 BookmarkIO::write() / read()
+    │
+    ├─ $this->synchronized(function () { ... })
+    │     │
+    │     └─ $this->mutex->synchronized($function)
+    │           │
+    │           ├─ flock(false, LOCK_EX)  ← 传入 false 作为 file handle
+    │           │     └─ PHP Warning: flock(): supplied resource is not a valid stream resource
+    │           │     └─ 返回 false
+    │           │
+    │           └─ malkusch/lock 检测到 flock 失败 → 抛出 LockAcquireException
+    │
+    └─ BookmarkIO::synchronized() 捕获 LockAcquireException
+          │
+          └─ 直接执行 $function() → 降级为无锁执行
+```
+
+**关键要点**：
+- FlockMutex 的**构造函数不会抛异常**，它只是保存传入的 file handle
+- 异常在**第一次实际使用锁**时（调用 `synchronized()`）才抛出
+- BookmarkIO 的 read() 和 write() 都经过 synchronized()，所以两者都会降级
+- **BookmarkIO 构造函数的 NoMutex 兜底**只在 `$mutex === null` 时生效，fopen 返回 false 不属于 null，所以走的是 synchronized() 内部的 LockAcquireException 捕获路径，而不是 NoMutex 路径
+
+### 17.4 锁完全失效后的系统行为全景
+
+当锁完全不可用时（持续抛 LockAcquireException），整个系统的并发保护降级为：
+
+| 组件 | 原保护 | 降级后 | 后果 |
+|------|--------|--------|------|
+| datastore 读取 | synchronized 内 file_get_contents | 直接 file_get_contents | 读操作本身无害，可能读到正在写入的半截数据 |
+| datastore 写入 | synchronized 内 file_put_contents | 直接 file_put_contents | ❗ 并发写可能产生混合内容 → 数据损坏 |
+| updates.txt 读写 | 无保护（本来就没锁） | 无保护 | 同第十章分析，进度可能丢失 |
+| config 写入 | 无保护 | 无保护 | 并发写可能配置损坏 |
+| history 写入 | 无保护 | 无保护 | 历史记录可能混乱 |
+
+### 17.5 ApplicationUtils::checkDatastoreMutex() 健康检查
+
+[ApplicationUtils::checkDatastoreMutex()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/helper/ApplicationUtils.php#L249-L261) 提供了锁健康检查：
+
+```php
+public static function checkDatastoreMutex(): array
+{
+    $mutex = new FlockMutex(fopen(SHAARLI_MUTEX_FILE, 'r'), 2);
+    try {
+        $mutex->synchronized(function () {
+            return true;
+        });
+    } catch (LockAcquireException $e) {
+        $errors[] = t('Lock can not be acquired on the datastore. You might encounter concurrent access issues.');
+    }
+    return $errors ?? [];
+}
+```
+
+这个检查应该在安装/升级后通过 Tools 页面运行，但**日常访问不会自动触发**。锁失效时用户不会收到任何警告，只会在并发场景下遇到数据损坏。
+
+### 17.6 锁降级的设计权衡
+
+| 设计选择 | 优点 | 缺点 |
+|----------|------|------|
+| 捕获 LockAcquireException 后无锁执行 | 兼容共享主机（很多共享主机不支持 flock），保证基本可用性 | 并发场景下数据可能损坏 |
+| 使用 init.php 作为锁文件 | 无需额外文件，一定存在 | 文件本身被误操作改权限时锁失效 |
+| 不自动检测锁失效 | 实现简单 | 用户无感知，出问题难排查 |
+
+---
+
+## 十八、半截 datastore 文件的 read 判定链路全解析
+
+### 18.1 产生半截文件的典型场景
+
+`file_put_contents()` 使用 `w` 模式（O_TRUNC + O_WRONLY），写入过程中进程意外终止会产生半截文件：
+
+| 场景 | 原因 | 半截程度 |
+|------|------|----------|
+| PHP `max_execution_time` 超时 | 大数据量写入时超时被强制终止 | 取决于写入速度，通常写了一部分 |
+| 内存耗尽 `exit` | 大 datastore 的 serialize/gzdeflate 内存不足 | 可能完全没写（内存错误发生在构造数据时） |
+| `kill -9` 进程 | 管理员强制杀进程 | 写了一部分 |
+| 服务器断电 | 硬件故障 | 写了一部分或完全没写 |
+| 磁盘满 | `disk_free_space` 检查后磁盘又被其他进程占用 | 写了一部分后失败 |
+
+注意：`BookmarkIO::write()` 内部有 `checkDiskSpace()` 检查（[BookmarkIO.php#L133-L135](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkIO.php#L133-L135)），但检查和写入之间有 TOCTOU 竞态窗口（时间差），且只在 synchronized 内部检查。
+
+### 18.2 半截文件的三种形态
+
+根据截断位置的不同，半截文件分为三种形态：
+
+#### 形态 A：仅 PHP 头部 + 部分 base64（尾部截断）
+
+```
+<?php /* S7QysKquBQA=...（后半段缺失）
+```
+- 缺少 ` */ ?>` 尾部
+- 文件大小：几字节到几千字节不等
+
+#### 形态 B：完整 PHP 包裹 + 中间 base64 截断（极罕见）
+
+```
+<?php /* S7QysKquBQA=...（中间断了）... */ ?>
+```
+- 头尾完整但中间 base64 数据缺了一块
+- 通常只在极特殊的并发写交叉场景出现（两个进程的 write 交错）
+
+#### 形态 C：空文件 / 仅 PHP 包裹
+
+```
+<?php /*  */ ?>
+```
+- truncate 之后立即被杀，还没开始写
+- 或只写了极少量数据
+
+### 18.3 BookmarkIO::read() 对三种形态的判定链路
+
+完整判定流程（基于 [BookmarkIO::read()](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkIO.php#L75-L104)）：
+
+```
+file_exists(datastore)
+  │
+  ├─ 否 → DatastoreNotInitializedException
+  │
+  └─ 是
+      │
+      is_writable(datastore)
+        │
+        ├─ 否 → NotWritableDataStoreException
+        │
+        └─ 是
+            │
+            file_get_contents → $content
+              │
+              substr($content, 9, -6)  // 剥 PHP 包裹
+                │
+                ├─ 如果尾部缺 " */ ?>": substr 从末尾取 -6 实际截取了有效数据
+                │   → base64 字符串短了 6 字节（或者更多，如果 truncate 严重）
+                │
+                base64_decode($payload)
+                  │
+                  ├─ 正常 base64 尾部被截断 → 返回部分二进制 + PHP Notice
+                  ├─ 严重损坏 → 返回 false
+                  │
+                  gzinflate($binary)
+                    │
+                    ├─ 数据流不完整 → false + PHP Warning
+                    │
+                    unserialize($inflated)
+                      │
+                      ├─ false 或损坏数据 → false + PHP Warning
+                      │
+                      empty($links)
+                        │
+                        ├─ true
+                        │   │
+                        │   filesize(datastore) > 100
+                        │     │
+                        │     ├─ 是 → NotWritableDataStoreException
+                        │     └─ 否 → EmptyDataStoreException
+                        │
+                        └─ false → 正常返回（极小概率：半截数据刚好能反序列化）
+```
+
+### 18.4 三种半截形态的判定结果对照表
+
+| 半截形态 | filesize | substr 结果 | base64_decode | gzinflate | unserialize | empty | filesize > 100 | 最终异常 |
+|----------|----------|------------|---------------|-----------|-------------|-------|---------------|----------|
+| 形态 A 轻微截断（几百字节） | >100B | base64 末尾少 6 字节 | 部分二进制 | false | false | true | 是 | **NotWritableDataStoreException** |
+| 形态 A 严重截断（<100B） | <100B | 极短 base64 | false/部分 | false | false | true | 否 | **EmptyDataStoreException** ❗ |
+| 形态 B 中间截断 | >100B | 完整长度 base64 但内容缺 | 不完整二进制 | false | false | true | 是 | **NotWritableDataStoreException** |
+| 形态 C 空/仅包裹 | 9~16B | 空/空 | false | false | false | true | 否 | **EmptyDataStoreException** ❗ |
+
+### 18.5 关键风险点：小半截文件触发空数据覆盖
+
+**最危险的场景**：datastore 只写了几十字节就崩溃了（文件 < 100 字节）。
+
+后果链：
+```
+1. 半截文件 < 100 字节
+2. BookmarkIO::read() → EmptyDataStoreException
+3. BookmarkFileService 构造函数 catch 住
+4. $this->bookmarks = new BookmarkArray()   ← 空数组
+5. 因为 isLoggedIn → $this->save()            ← 把空数据写回磁盘！
+6. ❗ 原本只是部分损坏、可能还有办法手动恢复的半截文件
+   被一份空的 BookmarkArray 彻底覆盖了
+```
+
+这是一个**危险的设计**：`EmptyDataStoreException` 的处理逻辑假设"空数据 = 需要初始化"，但实际上空/小文件也可能是**写入失败导致的损坏**。
+
+对比：`NotWritableDataStoreException` 不被 catch，会冒泡为 500 错误，用户能看到异常，不会触发自动覆盖。
+
+### 18.6 阈值 100 字节的来源与问题
+
+`filesize > 100` 的判断（[BookmarkIO.php#L97](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkIO.php#L97)）意图是区分：
+- 真正的空 datastore（新建的，只有 PHP 包裹壳）→ 初始化
+- 损坏的 datastore（应该有数据但读不出来）→ 报错
+
+但 100 字节是个**粗略阈值**：
+- 空 BookmarkArray 序列化后约 60-80 字节（base64 + PHP 包裹）
+- 只有 1-2 条书签的小型 datastore 可能也只有几百字节
+- 如果恰好 datastore 本身就很小，截断后可能落到 100 字节以下 → 误触发空数据覆盖
+
+更安全的设计应该用**校验和**或**版本标记**来区分"正常空数据"和"损坏数据"，而不是靠文件大小猜测。
+
+---
+
+## 十九、恢复备份期间的 UI 侧竞态与用户操作陷阱
+
+### 19.1 典型场景：用户手忙脚乱恢复备份
+
+**场景还原**：用户升级出问题了，按照文档说明用备份恢复。操作序列：
+
+```
+T0: 用户在浏览器 Tab1 看到错误页面
+T1: 用户 SSH 到服务器，执行 cp data/datastore.20240115143022.php data/datastore.php
+T2: cp 命令执行中...（大文件可能需要几秒）
+T3: 用户不耐烦，切回浏览器按了 F5 刷新
+T4: PHP 请求进入 → BookmarkFileService 构造
+     → 读到一个正在被 cp 的半截 datastore
+T5: cp 命令完成（但文件已经被 PHP 读了一半）
+```
+
+### 19.2 并发路径一：cp 过程中读触发空数据覆盖
+
+这是最危险的路径，发生在以下条件同时满足时：
+
+1. 备份文件较大（cp 需要时间）
+2. 用户在 cp 完成前刷新了页面
+3. 读到的半截数据 < 100 字节（恰好 cp 刚开始不久）
+
+```
+时间线（cp 命令 vs HTTP 请求）：
+
+进程 A（cp 命令）             进程 B（PHP 请求）
+───────────────────────      ───────────────────────
+T0: fopen(datastore, w)
+T1: write 前 50 字节
+                              T2: 浏览器刷新，PHP 启动
+                              T3: file_exists → true
+                              T4: is_writable → true
+                              T5: file_get_contents → 读到 50 字节半截
+                              T6: unserialize → false
+                              T7: empty → true + filesize=50 < 100
+                              T8: throw EmptyDataStoreException
+                              T9: BookmarkFileService catch → 初始化空 BookmarkArray
+                              T10: save() → 写入空数据（覆盖了 A 正在写的文件）
+T11: 继续写剩下的数据
+      → 写的是半截文件？不，A 的 fd 是独立的，继续从自己的 offset 写
+      → 但 B 的 save() 已经 truncate 并重写了文件
+      → A 的后续写入会追加？不，A 是 w 模式，有自己的 inode？
+      → 实际：如果 B 的 save() 是新的 fopen(w)，则文件 inode 不变，内容被替换
+         A 持有的旧 fd 仍然指向同一个文件（同一个 inode），
+         但 B 已经 truncate 了文件，A 的 write 会从 offset 50 开始写
+         → 最终文件 = 前 50 字节空数据 + A 的后半段备份数据
+         → 完全混乱，无法恢复
+```
+
+**最终后果**：备份文件和原始 datastore 都被破坏，两边都不完整。
+
+### 19.3 并发路径二：备份是旧格式 → 双 Tab 并发迁移
+
+如果用户恢复的是**遗留数组格式**的备份（FORMAT_A/B），恢复后的首次访问会触发 `migrate()` + `exit()`：
+
+```
+用户操作：
+T0: 恢复遗留格式备份
+T1: Tab1 刷新 → 触发 migrate() → 显示 "Please reload the page"
+T2: 用户还没看到提示，在 Tab2 又刷新了一下
+T3: Tab2 也触发 migrate() → 两个进程同时迁移
+```
+
+**竞态分析**（锁正常时）：
+- 迁移过程中有多次 datastore 读写
+- BookmarkIO 的 write 有 FlockMutex 保护
+- 但 migrate() 整体不是原子的（先读、再转换、再写）
+- 两个进程可能都读到旧格式数据、各自转换、各自写回
+- 由于输入相同、转换是纯函数，最终写回内容一致 → 安全
+
+**但锁降级时**：
+- 两个进程的 write 无锁交错 → 可能产生混合内容
+- 同第十三章分析的 datastore 并发写后果
+
+### 19.4 并发路径三：迁移中用户不断刷新
+
+`migrate()` 最后用 `exit()` 终止请求（[BookmarkFileService.php#L96-L99](file:///d:/fz/0601-1/solo-dogfeeding/code/80-Shaarli/application/bookmark/BookmarkFileService.php#L96-L99)）：
+
+```php
+exit(
+    'Your data store has been migrated, please reload the page.' . PHP_EOL .
+    'If this message keeps showing up, please delete data/updates.txt file.'
+);
+```
+
+用户看到这段纯文本提示后可能会：
+1. 立即按 F5 刷新 → 正常（迁移已完成，instanceof 通过）
+2. 但如果迁移**还没完成**就 exit 了？—— 不，migrate() 是同步执行的，exit() 在最后
+
+但有一种危险情况：
+- 迁移过程中某个 updateMethod 失败（返回 false）
+- 但 migrate() 不检查返回值，照常用 `exit()` 输出提示
+- 用户刷新 → 再次迁移 → 再次失败 → 无限循环
+- 文档提示 "If this message keeps showing up, please delete data/updates.txt file"
+- 但删除 updates.txt 会**重置所有升级进度**，包括已经成功的方法
+- 已经成功的方法可能因幂等性不好（如 escape 方法）导致数据损坏
+
+### 19.5 UI 侧竞态防护建议
+
+代码层面目前**没有任何防护**，需要用户手动遵守：
+
+1. **恢复备份前先停服务**：
+   ```bash
+   sudo systemctl stop php-fpm
+   cp backup.dat datastore.php
+   sudo systemctl start php-fpm
+   ```
+   
+2. **单 Tab 操作**：升级/恢复期间只开一个浏览器 Tab
+
+3. **看到迁移提示后等 3 秒再刷新**：确保 PHP 进程完全退出
+
+4. **恢复后先验证再使用**：
+   ```bash
+   php -r '
+     // 验证 datastore 完整性
+     $c = file_get_contents("data/datastore.php");
+     $d = substr($c, 9, -6);
+     $data = @unserialize(@gzinflate(@base64_decode($d)));
+     echo $data ? "OK, count=" . count($data) . "\n" : "FAIL\n";
+   '
+   ```
+
+---
+
+## 二十、降级方向兼容性：新版备份恢复到旧版本环境
+
+### 20.1 降级恢复的典型场景
+
+| 场景 | 原因 | 风险等级 |
+|------|------|----------|
+| 升级后功能不满意，想回滚到旧版本 | 用户操作 | 中 |
+| 新版有 Bug，紧急降级 | 生产事故 | 高 |
+| 开发环境用新版，生产环境用旧版，数据同步 | 部署问题 | 中 |
+| 备份是新版导出的，需要在旧版环境中恢复 | 备份混用 | 高 |
+
+### 20.2 PHP serialize 的降级方向规则
+
+旧版本代码 `unserialize()` 新版数据时：
+
+| 差异类型 | 行为 | 后果 |
+|----------|------|------|
+| 新版多了属性 | 属性保留在对象中，旧代码不访问 | ⚠️ 数据保留但不使用，下次 save 时会被序列化回去（形成"幽灵属性"） |
+| 新版少了属性 | 旧代码访问时 → `Undefined property` Notice | ❌ 功能异常，但不 fatal |
+| 类名变更 | `__PHP_Incomplete_Class` 对象 | ❌ 完全不可用，instanceof 全失败 |
+| 类被删除 | 同上 | ❌ 同上 |
+| 属性类型变更（如 array → object） | 保留原始类型 | ⚠️ 旧代码按旧类型使用可能出错 |
+
+Shaarli 的历史版本中，Bookmark 类的演变以**属性增加**为主，类名不变，属性类型基本稳定。所以降级的主要风险是**幽灵属性**和**新属性默认值丢失**。
+
+### 20.3 Bookmark 类属性的降级兼容性表
+
+| 属性 | 存在版本 | 降级到旧版后的行为 |
+|------|----------|-------------------|
+| `id` | 全部版本 | 正常 |
+| `title` | 全部版本 | 正常 |
+| `url` | 全部版本 | 正常 |
+| `description` | 全部版本 | 正常 |
+| `tags` | 全部版本 | 正常（数组类型稳定） |
+| `private` | 全部版本 | 正常 |
+| `thumbnail` | 全部版本 | 正常 |
+| `created` | v0.9+ | 正常（DateTime 对象） |
+| `updated` | v0.9+ | 正常（DateTime 对象） |
+| `shortUrl` | v0.9+ | 正常 |
+| `sticky` | v0.12+ | 旧版无此属性 → 旧代码 `$bookmark->sticky` 触发 Undefined property Notice，但不致命 |
+| `additionalContent` | 后期版本 | 幽灵属性，旧代码不访问 → 无功能影响，但下次 save 时会被序列化保留 |
+
+### 20.4 BookmarkArray 降级兼容性
+
+BookmarkArray 内部结构更稳定，主要属性（`$bookmarks`、`$ids`、`$keys`、`$urls`、`$position`）从引入以来变化不大。
+
+**降级风险点**：
+- 如果新版 BookmarkArray 增加了新属性，降级后这些属性作为幽灵属性存在
+- 旧版的 reorder() / 搜索等方法使用的是已知属性，不受幽灵属性影响
+- 但如果新版**修改了** `$bookmarks` 的内部结构（如从数组改成别的），会出问题（历史上没发生过）
+
+### 20.5 配置文件的降级兼容性
+
+配置降级比数据降级更危险，因为配置格式有明确的版本跳跃（PHP → JSON）：
+
+| 备份格式 | 恢复到旧版环境 | 后果 |
+|----------|---------------|------|
+| JSON 配置（config.json.php） | 只支持 PHP 配置的旧版 | ConfigManager 检测不到 `.php` 文件 → 用 JSON 格式加载 → 能正常读写 JSON → ⚠️ 但旧版代码可能依赖某些已删除/重命名的配置键 |
+| PHP 配置（config.php） | 新版环境 | 正常，新版兼容 PHP 格式 | ✅ 安全（有 ConfigPhp + LEGACY_KEYS_MAPPING） |
+| JSON 配置含新键 | 旧版 | 旧版 ConfigJson 能读，但旧代码不认识这些键 → 被忽略 | ⚠️ 新功能配置丢失 |
+
+**最严重的降级配置风险**：新版中某些配置键被重命名或合并，降级后旧版代码找不到对应的键 → 功能异常甚至错误。
+
+### 20.6 降级恢复的操作步骤
+
+#### 安全降级流程
+
+```
+步骤 1：在新版环境中导出为 Netscape HTML 格式（通用格式）
+        Tools → Export → 下载 .html 文件
+        （这是最安全的降级方式，不依赖 serialize）
+
+步骤 2：在新版环境中导出配置为 PHP 格式（如果旧版只支持 PHP）
+        或手动将 JSON 配置转换为 PHP 格式
+
+步骤 3：部署旧版本代码
+
+步骤 4：删除旧 data 目录，干净安装
+
+步骤 5：在旧版中导入 Netscape HTML 书签
+
+步骤 6：手动重新配置设置
+```
+
+#### 直接用 datastore 降级的风险操作（不推荐）
+
+```
+步骤 1：确认两个版本之间的 Bookmark 类差异
+        - 类名是否相同？
+        - 属性是只增不减吗？
+        - 是否有 __sleep/__wakeup 魔术方法？
+
+步骤 2：备份当前旧版的 data 目录
+
+步骤 3：将新版 datastore 覆盖过去
+
+步骤 4：访问验证
+        - 首页是否正常加载？
+        - 书签数量对不对？
+        - 打开单条书签有没有错误？
+        - 保存/编辑功能是否正常？
+
+步骤 5：如果异常，立即回滚
+```
+
+### 20.7 降级兼容性风险总表
+
+| 降级对象 | 风险等级 | 主要风险 | 恢复难度 |
+|----------|----------|----------|----------|
+| datastore (FORTC → FORMAT_C) | ⚠️ 中低 | 新属性丢失，幽灵属性残留 | 低（通常能用） |
+| datastore (FORTC → FORMAT_B) | ❌ 高 | 类不存在 → __PHP_Incomplete_Class | 高（需格式转换） |
+| config (JSON → PHP) | ❌ 高 | 旧版不支持 JSON 格式 | 中（需手动转换） |
+| updates.txt | ⚠️ 中 | 旧版不认新版的方法名，全部重跑 | 低（幂等方法安全） |
+| page cache | ✅ 低 | 缓存失效，重新生成 | 无 |
+| history.php | ⚠️ 中 | 历史记录格式可能不兼容 | 低（不影响核心功能） |
