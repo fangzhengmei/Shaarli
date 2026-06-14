@@ -800,3 +800,266 @@ URL参数: ?searchtags=linux+ubuntu&searchterm=hello
             ├── public → 仅公开书签
             └── private → 仅私有书签
 ```
+
+---
+
+## 十、深度分析：BookmarkFilter 核心代码追踪
+
+### 10.1 filterFulltext 三路搜索：mb_strpos 与 strpos 混用
+
+`filterFulltext` 包含精确匹配、AND 包含、NOT 排除三条独立的搜索路径，但字符串位置函数使用不一致。
+
+[BookmarkFilter.php#L273-L290](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L273-L290)：
+
+```php
+// 路径1 + 路径2：精确搜索和AND搜索 → mb_strpos
+foreach ([$exactSearch, $andSearch] as $search) {
+    for ($i = 0; $i < count($search) && $found !== false; $i++) {
+        $found = mb_strpos($content, $search[$i]);  // 多字节安全，返回位置
+        if ($found === false) {
+            break;
+        }
+        $foundPositions[] = ['start' => $found, 'end' => $found + mb_strlen($search[$i])];
+    }
+}
+
+// 路径3：排除搜索 → strpos
+for ($i = 0; $i < count($excludeSearch) && $found !== false; $i++) {
+    $found = strpos($content, $excludeSearch[$i]) === false;  // 只判断存在，不关心位置
+}
+```
+
+#### 三路搜索对比
+
+| 路径 | 搜索类型 | 使用函数 | 返回值用途 | 多字节安全 |
+|------|---------|---------|-----------|-----------|
+| 1 | 精确短语 `"..."` | `mb_strpos` | 返回匹配位置，用于 `search_highlight` 高亮 | ✅ 是 |
+| 2 | AND 关键词 | `mb_strpos` | 返回匹配位置，用于 `search_highlight` 高亮 | ✅ 是 |
+| 3 | NOT 排除 `-word` | `strpos` | 仅判断 `=== false`，不记录位置 | ❌ 否 |
+
+#### 为什么混用？
+
+1. **精确和 AND 搜索需要位置**：命中后要记录 `start` 和 `end` 位置，在 `BookmarkDefaultFormatter` 中渲染 `<span class="search-highlight">` 高亮。`mb_strpos` 返回的字符位置（而非字节位置）与 `mb_strlen` 计算的长度匹配，才能正确高亮多字节字符。
+
+2. **排除搜索只关心存在性**：`strpos(...) === false` 只需要知道"有没有"，不需要"在哪里"。只要搜索词和被搜索内容都经 `mb_convert_case` 转成小写 UTF-8，**纯 ASCII 排除词不会有问题**。
+
+#### 潜在边界问题
+
+如果排除词是纯中文（如 `-测试`），`strpos` 按字节搜索可能出现：
+- 被搜索内容中某汉字的某字节与排除词的某字节巧合匹配
+- 导致错误地排除或不排除
+
+实际风险较低，因为中文排除词前面有 `-` 前缀（ASCII），`strpos` 匹配 `-` 后继续匹配后续字节，在 UTF-8 编码下不会跨字符边界误匹配（UTF-8 首字节和续字节有明确范围区分）。但严格来说这是不一致的编码风格。
+
+---
+
+### 10.2 tag2regex：单字符早返回与链式前缀剥离顺序
+
+[BookmarkFilter::tag2regex](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L481-L500)：
+
+```php
+protected function tag2regex(string $tag): string
+{
+    $tagsSeparator = $this->conf->get('general.tags_separator', ' ');
+    // 早返回：单字符或~开头直接跳过
+    if (!$tag || $tag === "-" || $tag === "*" || $tag[0] === "~") {
+        return '';
+    }
+    $negate = false;
+    // 前缀剥离顺序：先 '+' → 再 '-'
+    if ($tag[0] === "+" && $tag[1]) {
+        $tag = substr($tag, 1);
+    }
+    if ($tag[0] === "-") {
+        $tag = substr($tag, 1);
+        $negate = true;
+    }
+    $term = $this->tag2matchterm($tag);
+    return $this->term2match($term, $negate);
+}
+```
+
+#### 单字符早返回逻辑
+
+| 输入标签 | 条件判断 | 返回值 | 说明 |
+|---------|---------|--------|------|
+| `''` | `!$tag` → true | `''` | 空标签跳过 |
+| `'-'` | `$tag === "-"` → true | `''` | 单独 `-` 无意义 |
+| `'*'` | `$tag === "*"` → true | `''` | 单独 `*` 无意义 |
+| `'~'` | `$tag[0] === "~"` → true | `''` | 单独 `~` 无意义 |
+| `'~foo'` | `$tag[0] === "~"` → true | `''` | **所有 ~ 开头的标签都跳过**，因为 OR 标签有单独处理路径 |
+
+注意：`$tag[0] === "~"` 优先级最高，任何 `~` 开头的标签（无论后面是什么）都会直接返回空字符串，不会进入前缀剥离逻辑。
+
+#### 链式前缀剥离顺序
+
+代码顺序是**先处理 `+`，再处理 `-`**，这个顺序会影响多前缀组合的语义：
+
+| 输入 | 步骤1: 剥 `+` | 步骤2: 剥 `-` | 最终标签 | `negate` | 语义 |
+|------|-------------|-------------|---------|----------|------|
+| `+-foo` | 匹配 `+` → `-foo` | 匹配 `-` → `foo` | `foo` | `true` | **排除 `foo`** |
+| `-+bar` | 第1字符是 `-`，不匹配 `+` | 匹配 `-` → `+bar` | `+bar` | `true` | **排除 `+bar` 这个标签名本身** |
+| `~-baz` | `tag[0] === '~'` → 早返回 `''` | - | - | - | OR 标签，在另一路径处理 |
+| `+-~qux` | 匹配 `+` → `-~qux` | 匹配 `-` → `~qux` | `~qux` | `true` | 排除标签名为 `~qux` 的标签 |
+
+**关键结论**：
+- `+-foo` 等同于 `-foo`：先剥 `+` 再剥 `-`，最终排除 `foo`
+- `-+bar` 不等同于 `+bar` 或 `-bar`：由于 `+` 只在第1字符时被剥，`-+bar` 剥掉 `-` 后剩下 `+bar` 作为标签名，最终排除的是字面量 `+bar` 标签
+- 这是一个设计上的不对称性：`+` 前缀必须是**第一个字符**才会被剥离，而 `-` 前缀在剥完 `+` 后只要在第一位就会被剥离
+
+---
+
+### 10.3 隐私旁路：`~.draft` 在 `visibility=public` 下的完整路径
+
+这是一个真实的隐私漏洞。让我们逐行追踪 `searchtags='~.draft'` 在未登录（`visibility=public`）时的执行路径。
+
+#### 路径追踪图
+
+```
+输入: searchtags='~.draft', visibility='public'
+    │
+    ▼ filterTags [BookmarkFilter.php#L317]
+    │
+    ├─ tags_str2array('~.draft', ' ') → ['~.draft']
+    │
+    ├─ 🔴 第332-340行：public可见性隐藏标签过滤
+    │   if ($visibility === self::$PUBLIC) {
+    │       $inputTags = array_values(array_filter($inputTags, function ($tag) {
+    │           return ! startsWith($tag, '.');
+    │       }));
+    │   }
+    │
+    │   startsWith('~.draft', '.') → false （第1字符是'~'不是'.'）
+    │   array_filter 保留 '~.draft' ✓
+    │   $inputTags = ['~.draft']
+    │
+    ├─ 第343行：构建 AND 正则
+    │   $re_and = implode(array_map('tag2regex', ['~.draft']))
+    │   tag2regex('~.draft') → 第484行 $tag[0] === '~' → return ''
+    │   $re_and = ''
+    │
+    ├─ 🔴 第346-348行：提取 OR 标签
+    │   $orTags = array_filter(array_map(function ($tag) {
+    │       return startsWith($tag, '~') ? substr($tag, 1) : null;
+    │   }, $inputTags));
+    │
+    │   startsWith('~.draft', '~') → true
+    │   substr('~.draft', 1) → '.draft'  ⚠️  隐藏标签泄露！
+    │   $orTags = [0 => '.draft']
+    │
+    ├─ 第350行：构建 OR 正则
+    │   $re_or = implode('|', array_map('tag2matchterm', ['.draft']))
+    │   tag2matchterm('.draft') → 第533行 preg_quote('.', '/') → '\.'
+    │   结果: '\.draft'
+    │
+    ├─ 第352-353行：包装成正向前瞻
+    │   $re_or = '(\.draft)'
+    │   $re .= term2match('(\.draft)', false)
+    │        → '(?=.*(?:^| )(\.draft)(?:$| ))'
+    │
+    ├─ 第356-359行：最终正则
+    │   $re = '/^' + '' + '(?=.*(?:^| )(\.draft)(?:$| ))' + '.*$/i'
+    │   结果: /^(?=.*(?:^| )(\.draft)(?:$| )).*$/i
+    │
+    ▼ 遍历书签进行正则匹配
+    │
+    └─ 匹配公开书签的标签字符串（含.description中的hashtag）
+       若某公开书签标签为 ['linux', '.draft']
+       其标签字符串为 'linux .draft'
+       正则匹配成功 ✓ → 该书签被返回
+```
+
+#### 漏洞根源
+
+问题出在 [BookmarkFilter.php#L333-L335](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L333-L335) 的 `array_filter`：
+
+```php
+$inputTags = array_values(array_filter($inputTags, function ($tag) {
+    return ! startsWith($tag, '.');
+}));
+```
+
+它只检查标签**直接以 `.` 开头**的情况，但 `~.draft` 以 `~` 开头，绕过了过滤。随后在第347行 `substr($tag, 1)` 剥掉 `~` 后，`.draft` 这个隐藏标签名被暴露给 OR 正则构建。
+
+**攻击向量**：未登录用户构造 URL `/?searchtags=~.hidden_tag_name`，即可搜索到**包含该隐藏标签的公开书签**。虽然书签本身是公开的，但隐藏标签（通常用于内部分类如 `.draft`、`.review`、`.internal`）的存在性信息被泄露。
+
+**修复思路**：在第347行 `substr` 之后再次检查是否为 `.` 前缀，或在 `tag2matchterm` 中加入可见性判断过滤隐藏标签。
+
+---
+
+### 10.4 真实组合正则示例
+
+以下是通过静态代码推导的各种组合搜索生成的真实正则表达式（分隔符为空格，大小写不敏感）：
+
+| 搜索标签 | 生成的正则 | 说明 |
+|---------|-----------|------|
+| `linux` | `/^(?=.*(?:^| )linux(?:$| )).*$/i` | 简单 AND |
+| `linux ubuntu` | `/^(?=.*(?:^| )linux(?:$| ))(?=.*(?:^| )ubuntu(?:$| )).*$/i` | 双 AND |
+| `linux -windows` | `/^(?=.*(?:^| )linux(?:$| ))(?!.*(?:^| )windows(?:$| )).*$/i` | AND + 排除 |
+| `~ubuntu ~debian` | `/^(?=.*(?:^| )(ubuntu|debian)(?:$| )).*$/i` | 纯 OR（注意：无 AND 条件时匹配所有含任一标签的书签） |
+| `linux ~ubuntu ~debian` | `/^(?=.*(?:^| )linux(?:$| ))(?=.*(?:^| )(ubuntu|debian)(?:$| )).*$/i` | AND + OR 组合 |
+| `+linux -windows` | `/^(?=.*(?:^| )linux(?:$| ))(?!.*(?:^| )windows(?:$| )).*$/i` | 显式 AND + 排除（与 `linux -windows` 等价） |
+| `+-secret` | `/^(?!.*(?:^| )secret(?:$| )).*$/i` | `+-` 链式：先剥 `+` 再剥 `-`，最终排除 secret |
+| `-+secret` | `/^(?!.*(?:^| )\+secret(?:$| )).*$/i` | `-+` 链式：剥 `-` 后 `+` 保留为标签名一部分，排除字面量 `+secret` |
+| `pro*` | `/^(?=.*(?:^| )pro[^ ]*?(?:$| )).*$/i` | 通配符：匹配 pro 开头的标签 |
+| `~.draft` (public) | `/^(?=.*(?:^| )(\.draft)(?:$| )).*$/i` | **⚠️ 隐私漏洞**：OR 前缀绕过 `.` 过滤，匹配隐藏标签 |
+| `.secret` (public) | `[]` (空) | 正常情况：`.secret` 被 array_filter 移除，返回空结果 |
+| `linux ~.draft` (public) | `/^(?=.*(?:^| )linux(?:$| ))(?=.*(?:^| )(\.draft)(?:$| )).*$/i` | **⚠️ 组合漏洞**：AND 正常标签 + OR 隐藏标签 |
+
+#### tag2matchterm 特殊字符转义验证
+
+`tag2matchterm` 对非 `*` 字符使用 `preg_quote($str, '/')` 转义，确保正则安全：
+
+| 标签名 | tag2matchterm 输出 | 说明 |
+|--------|-------------------|------|
+| `.draft` | `\.draft` | `.` 转义为 `\.` |
+| `tag?` | `tag\?` | `?` 转义为 `\?` |
+| `tag+name` | `tag\+name` | `+` 转义为 `\+` |
+| `tag(name)` | `tag\(name\)` | 括号转义 |
+| `tag[name]` | `tag\[name\]` | 方括号转义 |
+| `tag$` | `tag\$` | `$` 转义为 `\$` |
+| `tag^start` | `tag\^start` | `^` 转义为 `\^` |
+| `pro*` | `pro[^ ]*?` | `*` 特殊处理为通配符，不转义 |
+
+所有正则元字符都被正确转义 ✓。但通配符 `*` 被特殊处理为 `[^分隔符]*?`，这是有意设计的语法特性。
+
+---
+
+### 10.5 正则构建关键函数协作图
+
+```
+filterTags()
+    │
+    ├─ 输入: tags字符串 → tags_str2array() → $inputTags数组
+    │
+    ├─ [public可见性] array_filter 过滤 '.' 前缀
+    │   └── ⚠️  漏洞点: '~.tag' 绕过检查
+    │
+    ├─ AND 部分: array_map(tag2regex, $inputTags) → implode
+    │   │
+    │   └─ tag2regex($tag)
+    │       ├─ 早返回: 空/-/*/~开头 → ''
+    │       ├─ 剥 '+' 前缀（仅第1字符）
+    │       ├─ 剥 '-' 前缀，设置 negate=true
+    │       ├─ tag2matchterm($tag) → 转义正则字符，*→[^sep]*?
+    │       └─ term2match($term, $negate) → (?=...) 或 (?!...)
+    │
+    ├─ OR 部分: array_map 提取 '~' 前缀标签 → substr($tag,1)
+    │   │
+    │   └── ⚠️  漏洞点: '~.tag' → substr → '.tag' → 进入 tag2matchterm
+    │
+    ├─ 组合: '/^' + $re_and + $re_or_lookahead + '.*$' + 'i'
+    │
+    └─ 遍历书签: preg_match($re, $searchString)
+        └─ $searchString = tagsString + ' ' + descriptionHashtags
+```
+
+### 10.6 关键不一致性总结
+
+| 问题 | 位置 | 影响 |
+|------|-----|------|
+| `mb_strpos` vs `strpos` 混用 | filterFulltext 第278/289行 | 理论上多字节排除词可能不准确，实际风险低 |
+| `+` 前缀仅在第1字符剥离 | tag2regex 第489行 | `-+bar` 语义反直觉，`+` 成为标签名一部分 |
+| OR 标签路径无隐藏标签二次过滤 | filterTags 第346-354行 | **高风险隐私漏洞**：`~.hidden` 绕过 public 可见性检查 |
+| `strtolower` vs `mb_convert_case` | bookmarksCountPerTag 第341行 | 纯 ASCII 没问题，Unicode 大小写合并可能不完整 |
+| 通配符 `*` 不转义 | tag2matchterm 第520-522行 | 这是设计特性，不是 bug，但与其他字符处理不一致 |
