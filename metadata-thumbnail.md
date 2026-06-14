@@ -1370,5 +1370,252 @@ DefaultFinder 在提取后，**不会将相对路径转换为绝对 URL**——�
 | **COMMON_MEDIA_DOMAINS 误匹配** | `strpos` 模糊匹配，`evilimgur.com.example.com` 会命中 `imgur.com` | 低 |
 | **无 Content-Type 继承 bug 修复不完善** | 重定向场景下 Content-Type 继承逻辑存在 edge case | 低 |
 
+---
 
+## 21. 默认 enabled_plugins 清单与插件污染攻击的实际触发门槛
+
+### 21.1 默认启用插件清单
+
+[ConfigManager::$DEFAULT_PLUGINS](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/config/ConfigManager.php#L24)：
+
+```php
+public static $DEFAULT_PLUGINS = ['qrcode'];
+```
+
+[ConfigManager::setDefaultValues()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/config/ConfigManager.php#L368)：
+
+```php
+$this->setEmpty('general.enabled_plugins', self::$DEFAULT_PLUGINS);
+```
+
+**开箱即用，仅启用 qrcode 插件。** 插件加载流程：
+
+[index.php](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/index.php#L97)：
+
+```php
+$pluginManager->load($conf->get('general.enabled_plugins', []));
+```
+
+[PluginManager::load()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/plugin/PluginManager.php#L84-L100)：
+1. 遍历 `authorizedPlugins` 列表
+2. 检查插件目录是否存在于 `plugins/` 下
+3. 存在则 `include_once $dir . '/' . $pluginName . '.php'` 加载源码
+
+### 21.2 qrcode 插件的实际能力审计
+
+[plugins/qrcode/qrcode.php](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/plugins/qrcode/qrcode.php) 包含 3 个钩子函数：
+
+| 钩子函数 | 功能 | 是否操作 $data['url'] | 是否注册 save_link |
+|---------|------|---------------------|------------------|
+| `hook_qrcode_render_linklist()` | 在链接列表渲染时追加 QRCode HTML | ✅ 只读 `$value['url']` 填入 QR code 数据 | 否 |
+| `hook_qrcode_render_footer()` | 注入 QRCode JS 文件 | 否 | 否 |
+| `hook_qrcode_render_includes()` | 注入 QRCode CSS 文件 | 否 | 否 |
+
+- **无 `hook_qrcode_save_link()`**，即默认启用的 qrcode 插件 **不会** 触发 save_link 钩子链上的 `call_user_func`
+- 但 `hook_qrcode_render_linklist()` 中有 `file_get_contents(PluginManager::$PLUGINS_PATH . '/qrcode/qrcode.html')`，证明插件可通过 `file_get_contents()` 访问任意服务器可读路径——这本身不危险，但在 SSRF 语境下值得注意
+
+### 21.3 仓库内所有插件的 save_link 注册情况
+
+| 插件 | 是否有 `hook_{name}_save_link` | 默认启用 | 对 `$data` 的影响 |
+|------|-------------------------------|---------|-----------------|
+| qrcode | ❌ 无 | ✅ 是 | 无 |
+| demo_plugin | ✅ 有（写入 `stuff` 字段） | ❌ 否 | 可写任意 `$data` 字段 |
+| pubsubhubbub | ✅ 有（原封返回） | ❌ 否 | 无修改 |
+| readitlater | ❌ 无（仅有 `edit_link`、`render_linklist` 钩子） | ❌ 否 | 不涉及 save_link |
+
+### 21.4 实际触发门槛评估
+
+| 条件 | 说明 | 实际门槛 |
+|------|------|---------|
+| 默认配置 | 仅 qrcode 插件启用 | 🟩 **零风险**：qrcode 无 save_link 钩子，fromArray 污染路径不被触发 |
+| 启用 demo_plugin | 管理员在插件管理界面勾选启用 | 🟧 **中**：demo_plugin 不会主动改 URL，但代码模式展示了改 URL 的能力 |
+| 启用自定义恶意插件 | 管理员将自定义插件放入 `plugins/` 目录并启用 | 🟥 **高**：插件可直接修改 `$data['url']` 为任意协议 |
+| 插件上传漏洞 | 存在任意文件上传漏洞，写入恶意插件到 `plugins/` 目录并执行 | 🟥 **高**：等同于 RCE 前置步骤 |
+
+**修订前（第 16/18 章）结论**："save_link 插件钩子可污染 URL，风险高"
+
+**修订后结论**：
+- **开箱即用（默认 qrcode 插件）：零风险**。save_link 钩子链根本不会执行，因为没有任何插件注册该钩子。`executeHooks()` 的 foreach 循环无迭代。
+- **启用了非默认插件：风险取决于具体插件**。demo_plugin 本身不修改 URL；真正的风险来自 **管理员安装的自定义/第三方插件**。
+- **从"默认高风险"降级为"需要管理员主动行动"的威胁**。
+
+### 21.5 与 save_link 相邻的高危钩子：delete_link / edit_link
+
+虽然 save_link 默认无插件注册，但应关注其他可能影响 URL 的钩子。[demo_plugin](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/plugins/demo_plugin/demo_plugin.php#L452-L457) 的 `hook_demo_plugin_delete_link()` 中 `strpos($data['url'], 'youtube.com')` 证明了 delete_link 钩子同样接收完整的 `$data`（包含 `url`），且这些钩子在默认配置下同样无插件注册。
+
+---
+
+## 22. DefaultFinder extractMetaTag 源码：og:image 后处理核查
+
+### 22.1 extractMetaTag 正则实现
+
+[DefaultFinder::extractMetaTag()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Finder/DefaultFinder.php#L144-L169)：
+
+```php
+public static function extractMetaTag(string $content)
+{
+    $propertiesKey = ['property', 'name', 'itemprop'];
+    $properties = implode('|', $propertiesKey);
+    $ogRegex = '#<meta[^>]+(?:' . $properties . ')=["\']?og:image["\'\s][^>]*content=["\']?(.*?)["\'\s>]#';
+    $ogRegexReverse = '#<meta[^>]+content=["\']?([^"\'\s]+)[^>]+(?:' . $properties . ')=["\']?og:image["\'\s/>]#';
+    if (
+        preg_match($ogRegex, $content, $matches) > 0
+        || preg_match($ogRegexReverse, $content, $matches) > 0
+    ) {
+        return $matches[1];
+    }
+    return false;
+}
+```
+
+**关键观察**：
+1. **无 `html_entity_decode()`**：`extractMetaTag()` 本身 **不做 HTML 实体解码**
+2. **正则终止符**：`["\'\s>]` 确保只捕获 content 值本身
+3. **两种属性顺序**：`property=og:image content=XXX` 和 `content=XXX property=og:image` 均支持
+4. **支持三种属性名**：`property` / `name` / `itemprop`
+
+### 22.2 `html_entity_decode()` 的实际发生位置
+
+在 [Thumbnailer::getThumbnail()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Application/Thumbnailer.php#L133-L137) 中：
+
+```php
+$thumbUrl = $this->finder->find();
+$thumbUrl = $thumbUrl !== false ? html_entity_decode($thumbUrl) : $thumbUrl;
+file_put_contents($cache, $thumbUrl);
+```
+
+**解码发生在 Finder 返回之后、缓存写入之前**。例如 `https://example.com/a.jpg?x=1&amp;y=2` 会被正确解码为 `https://example.com/a.jpg?x=1&y=2`。
+
+### 22.3 是否做 absoluteUrl 化？—— **否**
+
+核查完整链路：`extractMetaTag()` → `find()` → `getThumbnail()` → `WebAccessFactory`，全程 **没有任何将相对 URL 转换为绝对 URL 的逻辑**。
+
+| og:image 内容 | 实际效果 |
+|--------------|---------|
+| `https://cdn.example.com/thumb.jpg` | ✅ 正常远程下载 |
+| `/images/og/thumb.jpg` | 🔴 首字符 `/` → `WebAccessLocal` → 读取服务器本地 `/images/og/thumb.jpg`（通常不存在） |
+| `./ogimage.jpg` | ⚠️ 首字符 `.` → `WebAccessCUrl` → cURL 报 URL 格式错误 |
+| `//evil.com/og.jpg`（协议相对 URL）| 🔴 首字符 `/` → `WebAccessLocal` → PHP 路径规范化为 `/evil.com/og.jpg`（不存在），反而降低 SSRF 风险 |
+| `/etc/passwd` | 🟥 `WebAccessLocal` → **file_get_contents('/etc/passwd')** |
+
+### 22.4 extractMetaTag 后处理总结
+
+| 后处理步骤 | 是否执行 | 执行位置 |
+|-----------|---------|---------|
+| HTML 实体解码 `html_entity_decode()` | ✅ 是 | `Thumbnailer::getThumbnail()` |
+| 相对 URL → 绝对 URL 转换 | ❌ 否 | — |
+| 协议校验 | ❌ 否 | — |
+| 域名校验 | ❌ 否 | — |
+| URL scheme 规范化 | ❌ 否 | — |
+| 路径规范化 / 路径穿越防护 | ❌ 否 | — |
+
+---
+
+## 23. ImageUtils 非图片输入处理：cache 目录副作用与残留核查
+
+### 23.1 generateThumbnail 的执行顺序
+
+[ImageUtils::generateThumbnail()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Utils/ImageUtils.php#L30-L95)：
+
+```php
+public static function generateThumbnail(
+    string $imageStr, string $target, int $maxWidth, int $maxHeight, bool $crop = false, ...
+): void {
+    if (!touch($target)) {                              // ① 首先创建空文件
+        throw new ImageConvertException('Target file is not writable.');
+    }
+    $sourceImg = static::imageCreateFromString($imageStr);  // ② GD 库解析图片
+    if ($sourceImg === false) {
+        throw new NotAnImageException();                    // 🔴 图片校验失败抛异常
+    }
+    // ... 调整大小、裁剪
+    imagejpeg($targetImg, $target);                          // ③ 最终写入有效 JPEG
+}
+```
+
+**关键时序：** `touch($target)` **先于** `imageCreateFromString()` 图片有效性验证执行。
+
+### 23.2 cache 目录残留物清单
+
+#### A. Finder 缓存（`cache/finder/{domain_md5}/{sha1(url)}`）
+
+[Thumbnailer::getThumbnail()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Application/Thumbnailer.php#L133-L137) 第 136 行：
+
+```php
+file_put_contents($cache, $thumbUrl);   // 无条件写入
+```
+
+- **写入内容**：解析出的 og:image URL 字符串（含 `/etc/passwd`、内网 URL 等攻击者构造的值）
+- **写入条件**：**无条件执行**，无论后续下载成功与否
+- **`.htaccess` 保护**：[CacheManager::createHtaccessFile()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Application/CacheManager.php#L113-L131) 为 finder 缓存写入 **deny from all** 的 `.htaccess`，但**仅在 Apache 环境下生效**。Nginx / Caddy 完全不受此保护，finder 缓存文本可被直接 HTTP 下载。
+
+#### B. Thumb 图片缓存（`cache/thumb/{domain_md5}/{sha1(url)}125901.jpg`）
+
+| 阶段 | 是否有残留 | 残留内容 |
+|------|-----------|---------|
+| `touch($target)` 成功，图片校验前抛异常 | ✅ **有 0 字节空文件** | 0 字节空 JPEG |
+| 图片解析成功但 `imagecopyresampled()` 失败 | ✅ 有 0 字节空文件 | 0 字节 |
+| `imagejpeg()` 写入成功 | ✅ 有合法 JPEG | 缩略图 |
+
+**0 字节空文件 → 缓存污染 DoS**：
+
+[CacheManager::isCacheValid()](https://github.com/ArthurHoaro/web-thumbnailer/blob/v2.2.0/src/Application/CacheManager.php#L80-L96)：
+
+```php
+if (is_readable($cacheFile) && (time() - filemtime($cacheFile)) < $cacheDuration) {
+    $out = true;  // 0 字节文件可读 + mtime 在 31 天内 → 判定为有效缓存！
+}
+```
+
+→ 下次请求直接返回 0 字节文件路径，浏览器显示裂图。**在默认 31 天缓存有效期内，该 URL 缩略图永久不可用**，除非管理员手动清除。
+
+### 23.3 Shaarli 外层 catch 的最终行为
+
+[Shaarli\Thumbnailer::get()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/Thumbnailer.php#L91-L97)：
+
+```php
+try {
+    return $this->wt->thumbnail($url);
+} catch (\Throwable $e) {
+    error_log(get_class($e) . ': ' . $e->getMessage());
+}
+return false;
+```
+
+所有异常被吞掉，仅写入 error_log；调用方得到 `false`，无 HTTP 500。
+
+### 23.4 cache 目录残留小结
+
+| 残留物 | 触发条件 | 影响 | 保护 |
+|-------|---------|------|------|
+| Finder 缓存（含 og:image URL） | 任意缩略图请求 | 泄漏攻击者构造的 URL 字符串 | Apache `.htaccess` deny（Nginx/Caddy 无效） |
+| Thumb 缓存（0 字节 JPEG） | og:image 指向非图片内容 | **缓存污染 DoS**：31 天内该 URL 缩略图永久失效 | 无 |
+| Thumb 缓存（合法 JPEG） | og:image 为合法图片 | 正常缩略图展示 | 无 |
+
+---
+
+## 24. 最终更新：全部安全发现全景（补充第 4 轮）
+
+| 类别 | 发现 | 严重度（修订后） |
+|------|------|-----------------|
+| **SSRF 默认暴露** | `thumbnails.mode` 默认 `MODE_ALL`，登录用户即可对任意 HTTP(S) URL 发起缩略图抓取；`enable_async_metadata` 默认 `true`，前端自动触发元数据抓取 | 中 |
+| **SSRF 匿名暴露** | `security.open_shaarli` 开启时，所有 SSRF 通道对外开放 | 高 |
+| **cURL 协议白名单缺失** | 未设置 `CURLOPT_PROTOCOLS` / `CURLOPT_REDIR_PROTOCOLS`，libcurl < 7.65.2 默认允许所有协议（含 file://、gopher://） | 高（老系统）/ 中（新系统） |
+| **og:image → WebAccessLocal 任意文件读** | WebThumbnailer 第二阶段 `WebAccessFactory` 按 URL 首字符分流：`/etc/passwd` 触发 WebAccessLocal → `file_get_contents($url)` **零校验**直接读取服务器任意本地文件，GD 仅阻止内容落盘 | 🟥 **高** |
+| **og:image → WebAccessCUrl 协议缺失** | 对 Finder 解析出的 `og:image` URL 无任何协议校验，libcurl < 7.65.2 时 `file://`、`gopher://` 协议生效 | 高（老系统）/ 低（新系统） |
+| **🆕 og:image 相对 URL 未转绝对** | `extractMetaTag()` 后仅做 `html_entity_decode()`，不将相对 URL / 协议相对 URL 转换为绝对 URL；`//evil.com/og.jpg` 被当作本地路径 `/evil.com/og.jpg` 处理 | 中（路径混淆） |
+| **WebThumbnailer PHP fallback 无内容过滤** | cURL 不可用时，`WebAccessPHP` 不启用 WRITEFUNCTION 回调，整页内容载入内存 | 中 |
+| **MetadataController CSRF 缺失** | GET `/admin/metadata?url=...` 无 token 校验，可被 `<img>` CSRF 触发内网请求 | 中 |
+| **ThumbnailsController CSRF 缺失** | PATCH `/admin/shaare/{id}/update-thumbnail` 无 token 校验 | 低（需 CORS 绕过） |
+| **ServerController clearCache CSRF 缺失** | GET `/admin/clear-cache?type=thumbnails` 无 token 校验，可被 CSRF 清除缓存放大 SSRF 面 | 低 |
+| **🆕 插件污染（修订）** | 默认仅 qrcode 插件启用，无 save_link 钩子 → **默认零风险**；需管理员主动安装并启用第三方自定义插件才触发 | 🟧 **中（仅非默认配置）** |
+| **fromArray() 绕过 setUrl()** | `Bookmark::fromArray()` 直接赋值 `$this->url`，不经过 `whitelist_protocols` 协议清洗；save_link 插件钩子可利用，但默认无插件注册 save_link | 中（依赖插件启用） |
+| **🆕 Cache 残留 DoS** | og:image 非图片输入时，`touch($target)` 先于 GD 图片验证执行 → 产生 0 字节 thumb 缓存文件 → `isCacheValid()` 误判为有效 → **31 天内该 URL 缩略图永久失效** | 中（可用性影响） |
+| **🆕 Finder 缓存信息泄漏** | Finder 缓存文件为文本，无条件写入解析出的 og:image URL（含恶意 `/etc/passwd` 等字符串）；Apache `.htaccess` 保护在 Nginx/Caddy 下无效 | 中（Nginx 部署）/ 低（Apache） |
+| **内网 IP 无黑名单** | 所有 HTTP 请求路径均未校验目标 IP 是否为私有地址段 | 高 |
+| **DNS Rebinding 无防护** | 未对 DNS 解析结果进行校验或缓存 | 中 |
+| **无请求速率限制** | 元数据与缩略图抓取端点无调用速率限制，可被大规模内网扫描 | 中 |
+| **下载提前终止 bug** | `get_http_response()` 的 download callback 终止条件依赖未传入变量，永不触发 | 低（性能影响） |
+| **COMMON_MEDIA_DOMAINS 误匹配** | `strpos` 模糊匹配，`evilimgur.com.example.com` 会命中 `imgur.com` | 低 |
+| **无 Content-Type 继承 bug 修复不完善** | 重定向场景下 Content-Type 继承逻辑存在 edge case | 低 |
 
