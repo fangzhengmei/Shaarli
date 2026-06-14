@@ -679,3 +679,342 @@ $this->checkToken($request);
 | **URL 来源** | update-thumbnail 使用存储中已清洗的 URL（可信），但保存阶段不校验内网 IP，攻击者可预埋恶意 URL；`/metadata` 端点直接接受用户输入的 URL |
 | **SSRF 深层风险** | ① open_shaarli + 未设置 PROTOCOLS → 匿名 FTP 内网探测；② CSRF 缺失 → 登录态下被第三方页面触发；③ 预埋 URL + update-thumbnail → 任意书签 URL 的 SSRF 触发 |
 
+---
+
+## 13. thumbnails.mode 默认值与开箱即用 SSRF 暴露面评估
+
+### 13.1 默认值溯源
+
+默认配置在 [ConfigManager::setDefaultValues()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/config/ConfigManager.php#L387-L389) 中：
+
+```php
+$this->setEmpty('thumbnails.mode', Thumbnailer::MODE_ALL);
+$this->setEmpty('thumbnails.width', '125');
+$this->setEmpty('thumbnails.height', '90');
+```
+
+同时 [ConfigManager::setDefaultValues()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/config/ConfigManager.php#L370-L371) 中：
+
+```php
+$this->setEmpty('general.enable_async_metadata', true);
+$this->setEmpty('security.allowed_protocols', ['ftp', 'ftps', 'magnet']);
+$this->setEmpty('security.open_shaarli', false);
+```
+
+**开箱即用的默认值组合**：
+
+| 配置项 | 默认值 | SSRF 影响 |
+|--------|--------|----------|
+| `thumbnails.mode` | `MODE_ALL` | ✅ 对所有 HTTP URL 启用缩略图抓取，无域名限制 |
+| `general.enable_async_metadata` | `true` | ✅ 前端自动触发 `/admin/metadata` AJAX 请求元数据 |
+| `security.open_shaarli` | `false` | ❌ 关闭，SSR F 通道仅限登录用户 |
+| `security.allowed_protocols` | `['ftp', 'ftps', 'magnet']` | ✅ FTP/FTPS 被加入书签 URL 协议白名单 |
+| `general.download_timeout` | 30s（LegacyUpdater 设置） | 单次请求最长阻塞 30s |
+| `general.download_max_size` | 4 MiB（LegacyUpdater 设置） | 元数据抓取单请求最多下载 4 MiB |
+
+### 13.2 旧版本迁移行为（LegacyUpdater）
+
+[LegacyUpdater::updateMethodWebThumbnailer()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/legacy/LegacyUpdater.php#L524-L539)：
+
+```php
+$thumbnailsEnabled = extension_loaded('gd') && $this->conf->get('thumbnail.enable_thumbnails', true);
+$this->conf->set('thumbnails.mode', $thumbnailsEnabled ? Thumbnailer::MODE_ALL : Thumbnailer::MODE_NONE);
+```
+
+- 从旧版本（< v0.12.0）升级时，如果旧配置 `thumbnail.enable_thumbnails` 未显式关闭（默认 `true`）且 GD 可用，则迁移为 `MODE_ALL`
+- **升级场景下也是默认启用缩略图**
+
+### 13.3 GD 不可用的降级
+
+[Thumbnailer 构造函数](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/Thumbnailer.php#L55-L61)：
+
+```php
+if (!extension_loaded('gd')) {
+    $this->conf->set('thumbnails.mode', Thumbnailer::MODE_NONE);
+    // TODO: improve user experience, redirect to server config with a warning message
+    die('Please install the PHP GD extension to use thumbnails feature.');
+}
+```
+
+GD 不可用时强制设为 `MODE_NONE` 并 `die()` 终止。这实际上 **保护了没有 GD 的服务器** 不暴露缩略图 SSRF 通道——但元数据抓取 `MetadataController` 不依赖 GD，依然可用。
+
+### 13.4 开箱即用 SSRF 暴露面矩阵
+
+| 场景 | 元数据抓取 `/admin/metadata` | 缩略图抓取（同步保存时） | 缩略图异步更新 `update-thumbnail` |
+|------|-------------------------------|------------------------|----------------------------------|
+| **默认配置（需要登录）** | ✅ 暴露于登录用户 | ✅ 暴露于登录用户（同步保存模式 `enable_async_metadata=false`） | ✅ 暴露于登录用户（书签列表页的 `data-async-thumbnail` 触发） |
+| **open_shaarli=true** | 🟥 暴露于任意匿名用户 | 🟥 暴露于任意匿名用户 | 🟥 暴露于任意匿名用户 |
+| **GD 不可用** | ✅ 暴露于登录用户（不依赖 GD） | ❌ 无（`MODE_NONE`） | ❌ 无 |
+| **thumbnails.mode=common** | ✅ 暴露于登录用户 | ⚠️ 仅 COMMON_MEDIA_DOMAINS 命中或 `.jpg/.png/.jpeg` 结尾的 URL 才触发 | ⚠️ 同上 |
+
+**结论：默认配置下 SSRF 暴露面为中等偏上**——登录用户即可对任意 HTTP(S) URL 发起元数据请求和缩略图请求。若管理员开启了 `open_shaarli`，暴露面扩大到全体互联网匿名用户。
+
+---
+
+## 14. cURL 重定向允许 FTP 协议的 libcurl 版本前提
+
+### 14.1 CURLOPT_REDIR_PROTOCOLS 的引入历史
+
+| 项目 | 版本 | 说明 |
+|------|------|------|
+| `CURLOPT_REDIR_PROTOCOLS` 选项加入 libcurl | **7.19.4**（2009-03） | 最初发布时默认值为 `CURLPROTO_ALL`，即重定向可跳转到所有协议（包括 file://, gopher://, scp:// 等危险协议） |
+| PHP 支持该选项 | PHP **5.2.10+** | PHP curl 扩展开始暴露此常量 |
+| **默认值收紧** | libcurl **7.65.2**（2019-06） | 此版本将默认值改为 `CURLPROTO_HTTP \| CURLPROTO_HTTPS \| CURLPROTO_FTP \| CURLPROTO_FTPS`——仅保留 Web 常用协议 |
+
+### 14.2 当前实际风险评估
+
+```
+libcurl < 7.65.2 → 默认 CURLPROTO_ALL → 重定向可到 file://、gopher://、dict:// 等所有协议
+                → 风险：极高（可读取本地文件 / 内网 Gopher 协议攻击 Redis/Memcached）
+
+libcurl >= 7.65.2 → 默认 HTTP/HTTPS/FTP/FTPS → 重定向仅限这四类
+                  → 风险：中等（仍可 FTP 内网探测，但无法直接读本地文件）
+```
+
+**关键前提验证**：Shaarli 代码中未显式设置 `CURLOPT_REDIR_PROTOCOLS`，因此 **完全依赖底层 libcurl 的默认行为**。
+
+- 现代服务器（2020 年后部署）大多数使用 libcurl ≥ 7.65.2，风险被限制在 HTTP/HTTPS/FTP/FTPS
+- 但企业内网 LTS 发行版（如 CentOS 7、RHEL 7）仍带 libcurl 7.29.0（2013），**默认允许所有协议**——此类部署存在高危 SSRF 到 `file:///etc/passwd` 的风险
+
+### 14.3 CURLOPT_PROTOCOLS 与 CURLOPT_REDIR_PROTOCOLS 的差异
+
+| 选项 | 作用 | 默认值（libcurl ≥ 7.65.2） |
+|------|------|---------------------------|
+| `CURLOPT_PROTOCOLS` | 限制初始请求允许的协议 | HTTP / HTTPS / FTP / FTPS |
+| `CURLOPT_REDIR_PROTOCOLS` | 限制重定向目标允许的协议 | HTTP / HTTPS / FTP / FTPS |
+
+两者默认值相同但语义不同：
+- **初始 URL**：Shaarli 在应用层已做 `Url::isHttp()` 检查（仅允许 HTTP/HTTPS），所以 `CURLOPT_PROTOCOLS` 对初始请求的默认值被应用层校验覆盖
+- **重定向 URL**：Shaarli **没有**对每次重定向目标重复做 `Url::isHttp()` 检查，完全依赖 `CURLOPT_REDIR_PROTOCOLS` 的默认值——这是协议风险的真正来源
+
+### 14.4 Shaarli 代码路径中的差异
+
+| 代码路径 | 初始 URL 协议校验 | 重定向协议保护 |
+|---------|-----------------|-------------|
+| `MetadataRetriever` → `HttpAccess::getHttpResponse()` → `get_http_response()` | ✅ `Url::isHttp()` + `FILTER_VALIDATE_URL` | ❌ 仅依赖 libcurl 默认 REDIR_PROTOCOLS |
+| `ThumbnailsController` → `Thumbnailer::get()` → WebThumbnailer `WebAccessCUrl` | ❌ **完全无初始 URL 协议校验**（URL 来自 `Bookmark::getUrl()`，存储时仅经过 `whitelist_protocols`） | ❌ 仅依赖 libcurl 默认 REDIR_PROTOCOLS |
+| WebThumbnailer 缩略图下载阶段（`og:image` URL） | ❌ **完全无校验**，URL 从远程页面 meta 标签解析 | ❌ 仅依赖 libcurl 默认 REDIR_PROTOCOLS |
+
+**最危险路径**：WebThumbnailer 下载从远程 HTML 解析出的 `og:image` URL——攻击者在目标网页设置 `<meta property="og:image" content="file:///etc/passwd">`，在 libcurl < 7.65.2 环境中，cURL 会尝试读取本地文件并送入 GD 库处理。GD 无法解析图片会报错，但文件读取动作已发生（可通过响应时间差异做盲数据提取）。
+
+---
+
+## 15. 管理员目录所有 Controller 的 CSRF Token 校验清单
+
+### 15.1 checkToken() 实现
+
+[ShaarliAdminController::checkToken()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaarliAdminController.php#L26-L37)：
+
+```php
+protected function checkToken(Request $request): bool
+{
+    if (!$this->container->sessionManager->checkToken($request->getParam('token'))) {
+        $this->saveErrorMessage(t('Invalid token!'));
+        $this->redirectFromReferer($request, $this->container->response, []);
+    }
+    return true;
+}
+```
+
+token 从请求参数 `$_REQUEST['token']`（即 GET + POST + Cookie）读取，校验失败后重定向并显示错误消息。
+
+### 15.2 完整清单（18 个 Admin Controller）
+
+| # | Controller | 方法 | HTTP 方法 | 是否校验 CSRF Token | SSRF 相关 |
+|---|-----------|------|-----------|-------------------|----------|
+| 1 | [ConfigureController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ConfigureController.php#L67) | `save()` | POST | ✅ `checkToken($request)`（第 67 行） | 可配置 thumbnails.mode |
+| 2 | [ExportController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ExportController.php#L37) | `process()` | POST | ✅ `checkToken($request)` | 否 |
+| 3 | [ImportController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ImportController.php#L51) | `import()` | POST | ✅ `checkToken($request)` | 可批量导入 URL（SSR F 预埋入口） |
+| 4 | [ManageTagController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ManageTagController.php#L46-L103) | `rename()` / `delete()` | POST | ✅ 两处均有 `checkToken` | 否 |
+| 5 | [PasswordController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/PasswordController.php#L45) | `save()` | POST | ✅ `checkToken` | 否 |
+| 6 | [PluginsController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/PluginsController.php#L56) | `save()` | POST | ✅ `checkToken` | 否 |
+| 7 | [ShaareManageController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareManageController.php) | `delete()` | POST | ✅（第 23 行） | 否 |
+| 8 | [ShaareManageController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareManageController.php) | `editSave()` | POST | ✅（第 84 行） | 可修改书签 URL |
+| 9 | [ShaareManageController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareManageController.php) | `bEdit()` | POST | ✅（第 150 行） | 可批量修改书签 URL |
+| 10 | [ShaareManageController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareManageController.php) | `pin()` | POST | ✅（第 186 行） | 否 |
+| 11 | [ShaareManageController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareManageController.php) | `bDelete()` | POST | ✅（第 214 行） | 否 |
+| 12 | [ShaarePublishController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaarePublishController.php#L100) | `save()` | POST | ✅ `checkToken($request)` | 可保存 URL 入库 |
+| 13 | 🔴 [MetadataController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/MetadataController.php) | `ajaxRetrieveTitle()` | GET | ❌ **无 CSRF 校验** | **直接 SSRF 入口** |
+| 14 | 🔴 [ThumbnailsController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ThumbnailsController.php) | `ajaxUpdate()` | PATCH | ❌ **无 CSRF 校验** | **SSRF 触发入口**（URL 来自存储） |
+| 15 | 🔴 [ServerController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ServerController.php#L71) | `clearCache()` | GET | ❌ **无 CSRF 校验** | 可清除缩略图缓存（迫使后续请求重新下载） |
+| 16 | [SessionFilterController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/SessionFilterController.php) | `visibility()` | GET | ❌ 无校验 | 否（仅切换可见性） |
+| 17 | [TokenController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/TokenController.php) | `getToken()` | GET | ❌ 无校验 | 自身就是 token 提供方 |
+| 18 | [LogoutController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/LogoutController.php) | `index()` | GET | ❌ 无校验 | 否（登出动作） |
+| 19 | [ToolsController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ToolsController.php) | `index()` | GET | ❌ 无校验 | 否（只读页面） |
+| 20 | [ShaareAddController](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareAddController.php) | `addShaare()` | GET | ❌ 无校验 | 否（仅展示表单） |
+
+### 15.3 CSRF 缺失的实际影响
+
+**MetadataController（GET `/admin/metadata?url=...`）**：
+
+- 浏览器 CORS 阻止第三方网页读取跨域 AJAX 响应内容，但 **请求本身会被发送**（Simple Request）
+- 攻击者可在钓鱼网站放置 `<img src="http://target-shaarli/admin/metadata?url=http://10.0.0.1:6379/">`，若用户当前已登录 Shaarli，浏览器会携带 session cookie 发起请求——服务器会向 `10.0.0.1:6379` 发起 HTTP 请求
+- 虽无法读取响应，但可用于内网端口扫描、服务存活探测
+
+**ThumbnailsController（PATCH `/admin/shaare/{id}/update-thumbnail`）**：
+
+- PATCH 不是 Simple Request，浏览器会先发 CORS preflight OPTIONS 请求
+- 若 Shaarli 未配置宽松的 CORS 策略，浏览器会阻止实际请求发出
+- 但若浏览器为旧版本或 CORS 配置存在疏漏，仍可触发
+- 更现实的攻击链：先通过 CSRF 保存恶意 URL 入库（ShaarePublishController `save()` 虽有 token，但如攻击者通过钓鱼诱导用户在已登录浏览器中提交），再通过图片墙页面正常触发缩略图下载
+
+**ServerController::clearCache()（GET `/admin/clear-cache?type=thumbnails`）**：
+
+- 可被 `<img>` 标签 CSRF 触发，清除缩略图缓存后，后续页面访问会强制重新从远程下载缩略图——配合预埋的恶意 URL 可放大 SSRF 攻击面
+
+---
+
+## 16. 书签 URL 入库的全部污染入口追查
+
+### 16.1 URL 清洗管道：Bookmark::setUrl()
+
+[Bookmark::setUrl()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/bookmark/Bookmark.php#L244-L253)：
+
+```php
+public function setUrl(?string $url, array $allowedProtocols = []): Bookmark
+{
+    $url = $url !== null ? trim($url) : '';
+    if (! empty($url)) {
+        $url = whitelist_protocols($url, $allowedProtocols);
+    }
+    $this->url = $url;
+    return $this;
+}
+```
+
+[whitelist_protocols()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/http/UrlUtils.php#L75-L89)：
+
+```php
+function whitelist_protocols($url, $protocols)
+{
+    $protocols = array_merge(['http', 'https'], $protocols);
+    $protocol = preg_match('#^(\w+):/?/?#', $url, $match);
+    if ($protocol === 1 && !in_array($match[1], $protocols)) {
+        $url = str_replace($match[0], 'http://', $url);
+    }
+    return $url;
+}
+```
+
+清洗逻辑**仅替换协议前缀**，不做任何域名/IP 校验。默认 `$allowedProtocols` 来自配置 `security.allowed_protocols = ['ftp', 'ftps', 'magnet']`，因此最终允许的协议为 `http / https / ftp / ftps / magnet`。
+
+### 16.2 入口 ①：管理员手动保存书签
+
+| 路径 | 文件位置 | CSRF 保护 | URL 来源 |
+|------|---------|----------|---------|
+| `POST /admin/shaare`（新建） | [ShaarePublishController::save()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaarePublishController.php#L100-L136) | ✅ token 校验 | `$request->getParam('lf_url')` → `$bookmark->setUrl($url, $this->container->conf->get('security.allowed_protocols'))` |
+| `POST /admin/shaare/{id}`（编辑保存） | [ShaareManageController::editSave()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareManageController.php#L84-L136) | ✅ token 校验 | 同上 |
+| `POST /admin/batch/shaare`（批量编辑） | [ShaareManageController::bEdit()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareManageController.php#L150-L177) | ✅ token 校验 | 逐本调用 `setUrl()` |
+
+所有手动保存路径都经过 `setUrl()` 协议清洗。
+
+### 16.3 入口 ②：书签文件批量导入
+
+[NetscapeBookmarkUtils::import()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/netscape/NetscapeBookmarkUtils.php#L88-L191)：
+
+```php
+foreach ($bookmarks as $bkm) {
+    // ...
+    $link->setTitle($bkm['name']);
+    $link->setUrl($bkm['url'], $this->conf->get('security.allowed_protocols'));  // 第 169 行
+    // ...
+    $this->bookmarkService->addOrSet($link, false);
+}
+```
+
+- URL 来自 `NetscapeBookmarkParser` 解析用户上传的 Netscape 书签文件
+- 经过 `setUrl()` 协议清洗
+- 有 CSRF 保护（[ImportController::import()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ImportController.php#L51) 第 51 行 `checkToken`）
+- **可被用作 SSRF 预埋批量入口**：管理员上传构造的书签文件，其中包含大量内网地址，导入后触发缩略图/元数据抓取
+
+### 16.4 入口 ③：插件钩子 save_link 污染
+
+[ShaarePublishController::save()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaarePublishController.php#L130-L135)：
+
+```php
+// To preserve backward compatibility with 3rd parties, plugins still use arrays
+$formatter = $this->getFormatter('raw');
+$data = $formatter->format($bookmark);
+$this->executePageHooks('save_link', $data);
+$bookmark->fromArray($data, $this->container->conf->get('general.tags_separator', ' '));
+```
+
+[Bookmark::fromArray()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/bookmark/Bookmark.php#L69-L91)：
+
+```php
+public function fromArray(array $data, string $tagsSeparator = ' '): Bookmark
+{
+    // ...
+    $this->url = $data['url'] ?? null;  // ⚠️ 第 73 行
+    // ...
+}
+```
+
+**🔴 关键安全漏洞**：`fromArray()` 直接将 `$data['url']` 赋值给 `$this->url`，**不经过 `setUrl()` 的 `whitelist_protocols()` 协议清洗**。
+
+这意味着：
+1. 第三方插件在 `save_link` 钩子中修改 `$data['url']` 时，可以注入任意协议（如 `file://`、`gopher://`）
+2. 被污染的 URL 直接入库，后续 `update-thumbnail` 和元数据抓取将使用被污染的 URL 发起请求
+3. 相同的 `save_link` → `fromArray()` 模式在以下 4 处存在：
+   - [ShaarePublishController::save()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaarePublishController.php#L135) 第 135 行
+   - [ShaareManageController::editSave()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareManageController.php#L132) 第 132 行
+   - [ShaareManageController::bEdit()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareManageController.php#L174) 第 174 行
+   - [ShaareManageController::bDelete()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/front/controller/admin/ShaareManageController.php#L275) 第 275 行
+
+### 16.5 入口 ④：LegacyUpdater 数据迁移
+
+[LegacyUpdater::updateMethodBookmarksToEntities()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/legacy/LegacyUpdater.php#L589-L591)：
+
+```php
+$linksArray = new BookmarkArray();
+foreach ($this->linkDB as $key => $link) {
+    $linksArray[$key] = (new Bookmark())->fromArray($link, $this->conf->get('general.tags_separator', ' '));
+}
+```
+
+- 旧数据格式的 URL 直接通过 `fromArray()` 载入，不经过 `setUrl()` 协议清洗
+- 但旧链接在原存储中本就已入库，属于既有数据，不构成新的污染路径
+
+### 16.6 入口 ⑤：BookmarkInitializer 默认书签
+
+[BookmarkInitializer::initialize()](file:///d:/fz/0601-1/solo-dogfeeding/code/78-Shaarli/application/bookmark/BookmarkInitializer.php#L39-L114)：
+
+- 硬编码的 3 条默认书签 URL（YouTube、Shaarli 项目等）
+- **调用 `setUrl()`**：`$bookmark->setUrl('https://www.youtube.com/watch?v=DVEUcbPkb-c')`
+- 无用户输入，无安全风险
+
+### 16.7 污染入口风险汇总
+
+| 入口 | URL 清洗方式 | CSRF 保护 | 风险级别 | 说明 |
+|------|------------|----------|---------|------|
+| 管理员新建/编辑书签 | ✅ `setUrl()` + `whitelist_protocols` | ✅ | 低 | 仅 HTTP(S)/FTP(S)/magnet |
+| Netscape 书签导入 | ✅ `setUrl()` + `whitelist_protocols` | ✅ | 中 | 批量导入，可预埋大量内网 URL |
+| `save_link` 插件钩子 | ❌ **`fromArray()` 直接赋值，绕过 `setUrl()`** | ✅ | 🟥 **高** | 恶意插件可注入任意协议 URL |
+| LegacyUpdater 迁移 | ❌ `fromArray()` 直接赋值 | N/A | 低 | 既有数据迁移 |
+| BookmarkInitializer | ✅ `setUrl()` | N/A | 无 | 硬编码安全 URL |
+
+**最高风险发现**：插件通过 `save_link` 钩子可以将任意 URL（含 `file://`、`gopher://`、内网地址）写入书签，绕过协议白名单。虽然插件安装本身需要管理员权限，但这打破了"所有入库 URL 都经过 `whitelist_protocols` 清洗"的安全假设。
+
+---
+
+## 17. 最终汇总：全部安全发现全景
+
+| 类别 | 发现 | 严重度 |
+|------|------|--------|
+| **SSRF 默认暴露** | `thumbnails.mode` 默认 `MODE_ALL`，登录用户即可对任意 HTTP(S) URL 发起缩略图抓取；`enable_async_metadata` 默认 `true`，前端自动触发元数据抓取 | 中 |
+| **SSRF 匿名暴露** | `security.open_shaarli` 开启时，所有 SSRF 通道（metadata、update-thumbnail、保存书签）对外开放 | 高 |
+| **cURL 协议白名单缺失** | 未设置 `CURLOPT_PROTOCOLS` / `CURLOPT_REDIR_PROTOCOLS`，libcurl < 7.65.2 默认允许所有协议（含 file://、gopher://） | 高（老系统）/ 中（新系统） |
+| **WebThumbnailer og:image 无协议校验** | 从远程页面解析出的 `og:image` URL 无任何协议/域名校验，直接传入 WebAccess 请求 | 高 |
+| **WebThumbnailer PHP fallback 无内容过滤** | cURL 不可用时，`WebAccessPHP` 不启用 WRITEFUNCTION 回调，整页内容载入内存 | 中 |
+| **MetadataController CSRF 缺失** | GET `/admin/metadata?url=...` 无 token 校验，可被 `<img>` CSRF 触发内网请求 | 中 |
+| **ThumbnailsController CSRF 缺失** | PATCH `/admin/shaare/{id}/update-thumbnail` 无 token 校验 | 低（需 CORS 绕过） |
+| **ServerController clearCache CSRF 缺失** | GET `/admin/clear-cache?type=thumbnails` 无 token 校验，可被 CSRF 触发缓存清除以放大 SSRF | 低 |
+| **fromArray() 绕过 setUrl()** | `Bookmark::fromArray()` 直接赋值 `$this->url`，不经过 `whitelist_protocols` 协议清洗；`save_link` 插件钩子可利用此路径污染 URL | 高 |
+| **内网 IP 无黑名单** | 所有 HTTP 请求路径均未校验目标 IP 是否为私有地址段（10.x/8、172.16/12、192.168/16、127/8、169.254/16） | 高 |
+| **DNS Rebinding 无防护** | 未对 DNS 解析结果进行校验或缓存，存在 DNS 重新绑定攻击面 | 中 |
+| **无请求速率限制** | 除登录失败封禁外，元数据与缩略图抓取端点无调用速率限制，可被用于大规模内网扫描 | 中 |
+| **下载提前终止 bug** | `get_http_response()` 的 download callback 终止条件依赖未传入的变量，永不触发，实际下载到 maxBytes 或超时 | 低（性能影响） |
+| **COMMON_MEDIA_DOMAINS 误匹配** | `strpos` 模糊匹配，`evilimgur.com.example.com` 会命中 `imgur.com` | 低 |
+| **无 Content-Type 继承 bug 修复不完善** | 重定向场景下 Content-Type 继承逻辑存在 edge case | 低 |
+
+
