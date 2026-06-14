@@ -463,7 +463,512 @@ if ($bookmark->isNote() && $prependNoteUrl) {
 
 ---
 
-## 9. 关键代码索引
+## 10. 第三方解析库 H3 / DL 嵌套遍历与文件夹名追加
+
+### 10.1 解析器三层架构
+
+`Shaarli\NetscapeBookmarkParser` v4.0.0 （commit `aa024e5731959966660d98fcefe27deada40d88e`）采用三层责任链：
+
+```
+NetscapeBookmarkParser::parseString()
+        │  入口兼容层（向后兼容旧 API）
+        ▼
+NetscapeBookmarkDecoder::decode()
+        │  核心解析：逐行正则 + 状态机遍历
+        ▼
+     输出 PHP 关联数组
+```
+
+构造器在 [NetscapeBookmarkParser](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/vendor/shaarli/netscape-bookmark-parser/src/NetscapeBookmarkParser.php) L33-L38 中固定了默认上下文：
+
+```php
+private $defaultContext = [
+    NetscapeBookmarkDecoder::KEEP_NESTED_TAGS => true,   // 启用文件夹名→标签
+    NetscapeBookmarkDecoder::NORMALIZE_DATES  => true,
+    NetscapeBookmarkDecoder::DATE_RANGE       => '30 years',
+];
+```
+
+### 10.2 `sanitizeString()`：HTML 预处理
+
+在进入逐行遍历前，`NetscapeBookmarkDecoder::sanitizeString()`（L374-L429）对原始字符串做归一化：
+
+| 步骤 | 正则/函数 | 作用 |
+|------|-----------|------|
+| 1 | `preg_replace('@<!--.*?-->@mis', '', ...)` | 剥离 HTML 注释块 |
+| 2 | `preg_replace('@>(\s*?)<@mis', ">\n<", ...)` | 在 `><` 之间插换行，确保"每行一元素" |
+| 3 | `preg_replace('@(<!DOCTYPE|<META|<TITLE|<H1|<P).*\n@i', '', ...)` | 删除元数据行（注意 META 行在此移除） |
+| 4 | `trim($bookmark)` | 去除首尾空白 |
+| 5 | `str_replace("\r", '', $bookmark)` | 删除回车符（统一 LF 换行） |
+| 6 | `<DD>` + `<A>` 多行→单行回调 | 将实际换行转义为 Unicode 字符 `▄` 占位 |
+| 7 | `preg_replace('@\n<DD@i', '<DD', ...)` | 把 `<A>` 与后续 `<DD>` 粘到同一行 |
+
+**编码陷阱**：步骤 3 把 `<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=XXX">` 这行完全删除。因此 HTML meta charset **只能在进入 sanitizeString 之前被外部探测**，解析器内部不会再看到 charset 声明。
+
+### 10.3 `decode()` 主循环：线性状态机遍历
+
+在 `NetscapeBookmarkDecoder::decode()` L98-L248 中，采用**栈式状态机**处理嵌套结构：
+
+```
+初始化:
+    $items = []                // 输出书签数组
+    $folderTags = []           // 当前生效的扁平化文件夹标签（一维数组）
+    $groupedFolderTags = []    // 栈：每层文件夹的标签数组 [[layer0], [layer1], ...]
+
+按行循环: explode("\n", sanitizeString($data))
+    │
+    ├── 匹配 /^<h\d.*>(.*)<\/h\d>/i  →  H1~H6 任意级别标题
+    │       │
+    │       ├─ $header[1] = H3 文本内容（文件夹名）
+    │       ├─ $tag = sanitizeTags($header[1])   // 分割+小写+过滤
+    │       ├─ array_push($groupedFolderTags, $tag)   // 入栈
+    │       └─ $folderTags = flattenTagsList($groupedFolderTags)  // 展平为一维
+    │
+    ├── 匹配 /^<\/DL>/i  →  文件夹闭合标签
+    │       │
+    │       ├─ array_pop($groupedFolderTags)    // 出栈一层
+    │       └─ $folderTags = flattenTagsList($groupedFolderTags)  // 重新展平
+    │
+    ├── 匹配 /<a/i  →  书签链接（含 <DT><A HREF="..." ...>TITLE</A>）
+    │       │
+    │       ├─ href="(.*?)"  → $item['url']
+    │       ├─ icon="(.*?)"  → $item['image']
+    │       ├─ <a.*?>(.*?)</a>  → $item['name']
+    │       ├─ description/note 属性 或 <dd>(.*?)$  → $item['description']
+    │       ├─ $tags = ($keepNestedTags ? $folderTags : [])   // ★ 文件夹标签前缀
+    │       ├─ tags/labels/folders="..." → splitTagString() 并 append 到 $tags
+    │       ├─ add_date → parseDate() → $item['dateCreated']
+    │       ├─ public/published/pub / private/shared → parseBoolean() → $item['public']
+    │       └─ $items[] = $item
+    │
+    └── 其他行（<DT>、<DL>、<p> 等无内容行） → 忽略
+```
+
+### 10.4 三级嵌套的栈状态演示
+
+以 [netscape_nested.htm](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/tests/netscape/input/netscape_nested.htm) 为例：
+
+| 行 | 匹配类型 | `$groupedFolderTags` 栈 | `$folderTags` 扁平 |
+|----|---------|------------------------|-------------------|
+| `<H3>Folder1</H3>` | H3 | `[['folder1']]` | `['folder1']` |
+| 书签 1-1 | `<A>` | `[['folder1']]` | `['folder1']`  → 追加到 tags |
+| 书签 1-2 | `<A>` | `[['folder1']]` | `['folder1']`  → 追加到 tags |
+| `</DL>` | 闭合 | `[]` | `[]` |
+| `<H3>Folder2</H3>` | H3 | `[['folder2']]` | `['folder2']` |
+| 书签 2-1, 2-2 | `<A>` | `[['folder2']]` | `['folder2']` |
+| `</DL>` | 闭合 | `[]` | `[]` |
+| `<H3>Folder3</H3>` | H3 | `[['folder3']]` | `['folder3']` |
+| `<H3>Folder3-1</H3>` | H3 | `[['folder3'], ['folder3-1']]` | `['folder3', 'folder3-1']` |
+| 书签 3-1, 3-2 | `<A>` | 同上 | `['folder3', 'folder3-1']` → 追加到 tags |
+| `</DL>` | 内层闭合 | `[['folder3']]` | `['folder3']` |
+| `</DL>` | 外层闭合 | `[]` | `[]` |
+
+### 10.5 `flattenTagsList()`：二维栈展开到一维标签链
+
+位于 `NetscapeBookmarkDecoder` 末尾（L491 附近），函数签名推断：
+
+```php
+public static function flattenTagsList(array $groupedFolderTags): array
+{
+    // 把 [['folderA'], ['folderB', 'folderC']]
+    // 展开为 ['folderA', 'folderB', 'folderC']
+    return array_reduce(
+        $groupedFolderTags,
+        fn ($acc, $tags) => array_merge($acc, $tags),
+        []
+    );
+}
+```
+
+这是一个纯粹的"二维栈 → 一维数组"拼接，保证文件夹层级按嵌套从外到内的顺序排列。
+
+### 10.6 `sanitizeTags()` 路径：文件夹名 → 标签数组
+
+文件夹名 `Folder3-1` 进入 `sanitizeTags()`（L446-L479 附近）的完整调用链：
+
+```
+H3 捕获文本 "Folder3-1"
+    │
+    └─ sanitizeTags("Folder3-1")
+           │
+           ├─ 1. 判定分隔符: strpos(',') === false → 使用 ' ' 空格
+           │
+           ├─ 2. splitTagString("Folder3-1", ' ')
+           │      │
+           │      ├─ explode(' ', strtolower("Folder3-1"))
+           │      │          = ['folder3-1']   ★ 在此处完成小写化
+           │      │
+           │      ├─ preg_replace('/\s{2,}/', ' ', $tags)  // 合并多空格
+           │      │
+           │      └─ array_map('trim') + array_filter
+           │             = ['folder3-1']
+           │
+           └─ 3. 非纯字母数字的标签二次清洗（删除开头标点等）
+                  最终返回 ['folder3-1']
+```
+
+---
+
+## 11. 文件夹名变小写的精确代码位置
+
+### 11.1 唯一位置：`splitTagString()` 中的 `strtolower()`
+
+在 `NetscapeBookmarkDecoder::splitTagString()`（L433-L442）：
+
+```php
+public static function splitTagString(string $tagString, string $separator): array
+{
+    $tags = explode($separator, strtolower($tagString));   // ← 唯一小写化位置
+    $tags = preg_replace('/\s{2,}/', ' ', $tags);
+    return array_values(array_filter(array_map('trim', $tags)));
+}
+```
+
+**关键结论：**
+1. 小写化发生在 `explode` **之前**，`strtolower($tagString)` 是对整串操作
+2. 函数入口有两条路径，全部都经过小写化：
+   - 路径 A：H3 文件夹名 → `sanitizeTags()` → `splitTagString()` → 小写
+   - 路径 B：`<A TAGS="Tag1,Tag2">` 属性 → `splitTagString()` → 小写
+3. 使用 PHP 内置 `strtolower()`，**不支持多字节（非 ASCII）字符**。对中文/日文等 UTF-8 多字节字符无影响（原样保留），但对带重音的拉丁字符（如 `É` → `é`）可能因 locale 设置而行为不一致
+4. Shaarli 自身在 `BookmarkFilter::filterAll()` 等搜索场景使用 `mb_convert_case($val, MB_CASE_LOWER, 'UTF-8')`（见 [BookmarkFilter.php:L620-L623](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/BookmarkFilter.php#L620-L623)），因此导入时的单字节小写化与搜索时的多字节小写化存在**标准不一致**
+
+### 11.2 小写化影响范围对照表
+
+| 输入 | 解析后标签 | 说明 |
+|------|-----------|------|
+| `Folder1` | `folder1` | 纯 ASCII 标题 |
+| `Folder3-1` | `folder3-1` | 带连字符 |
+| `My Tag` | `my tag` → `['my', 'tag']` | 空格分隔拆为两个 |
+| `Tag1,Tag2` | `['tag1', 'tag2']` | 逗号分隔 |
+| `标签A` | `标签a`（视 locale，通常保持 `标签A`） | UTF-8 中文 + 字母 |
+| `ÉTÉ` | `été`（若 locale 为 UTF-8 则失败） | 带重音字符需 `mb_strtolower` |
+
+### 11.3 注意：META 行被剥离
+
+`sanitizeString()` 的步骤 3 用正则 `'@(<!DOCTYPE|<META|<TITLE|<H1|<P).*\n@i'` 把 `<META ... charset=...>` 整行删除。因此**任何基于该行的编码识别都必须在调用 `decode()` 之前完成**。解析器本身没有任何字符集转换逻辑，一律按原始字节做正则匹配。
+
+---
+
+## 12. URL 字段处理完整路径：trim、协议补全、尾斜杠
+
+### 12.1 调用链总览
+
+```
+解析器 href="..." 捕获
+    │  NetscapeBookmarkDecoder::decode() L163
+    │  $item['url'] = $href[1]   ← 正则 /href="(.*?)"/i，不做任何处理
+    ▼
+NetscapeBookmarkUtils::import() L169
+    │  $link->setUrl($bkm['url'], $allowedProtocols)
+    ▼
+Bookmark::setUrl() L244-L253
+    │  ├─ 1. $url = cleanup_url($url)        ← URL 构造 + Firefox Reader 剥除
+    │  ├─ 2. $url = whitelist_protocols(...) ← 协议白名单过滤 + 缺省补全
+    │  └─ 3. $this->url = $url                ← 写入
+    ▼
+存储 + 索引
+    │  BookmarkArray::offsetSet()
+    │  $this->urls[$bookmark->getUrl()] = $offset
+    └─ 精确字符串匹配进行去重
+```
+
+### 12.2 第一层：`cleanup_url()` → `Url` 类构造
+
+在 [Bookmark::setUrl()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/Bookmark.php#L244-L253) 内调用：
+
+```php
+public function setUrl(?string $url, array $allowedProtocols = []): Bookmark
+{
+    $url = cleanup_url($url);   // L245
+    // ...
+    $this->url = whitelist_protocols($url, $allowedProtocols);  // L249
+}
+```
+
+`cleanup_url()` 在 [UrlUtils.php:L27-L32](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/UrlUtils.php#L27-L32)：
+
+```php
+function cleanup_url($url)
+{
+    $urlObj = new Url($url);
+    return $urlObj->cleanup();
+}
+```
+
+进入 [Url::__construct()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/Url.php#L62-L71)：
+
+```php
+public function __construct($url)
+{
+    $url = $url ?? '';
+    $url = self::cleanupUnparsedUrl(trim($url));   // ★ L65: 唯一的 trim 位置
+    $this->parts = parse_url($url);
+
+    if (!empty($url) && empty($this->parts['scheme'])) {
+        $this->parts['scheme'] = 'http';   // ★ L69: 临时补 scheme 以便后续重建
+    }
+}
+```
+
+**Trim 位置确认**：`trim($url)` 位于 Url 构造器 L65，仅去除**首尾空白字符**（空格、`\t`、`\n`、`\r`、`\0`、`\v`）。不处理 URL 内部空格，不处理尾部斜杠。
+
+### 12.3 Firefox Reader 前缀剥除
+
+`cleanupUnparsedUrl()`（[Url.php:L81-L84](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/Url.php#L81-L84)）调用 `removeFirefoxAboutReader()`：
+
+```php
+protected static function removeFirefoxReader($input)
+{
+    $firefoxPrefix = 'about://reader?url=';
+    if (startsWith($input, $firefoxPrefix)) {
+        return urldecode(ltrim($input, $firefoxPrefix));
+    }
+    return $input;
+}
+```
+
+- 仅当 URL 字面以 `about://reader?url=` 开头时触发
+- `ltrim()` 在此处**仅用于剥除已知前缀字符**，不是通用 trim
+- 之后 `urldecode()` 还原被百分号编码的原始 URL
+
+### 12.4 第二层：`whitelist_protocols()` 协议补全与过滤
+
+在 [UrlUtils.php:L75-L106](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/UrlUtils.php#L75-L106)：
+
+```php
+function whitelist_protocols($url, $protocols)
+{
+    // L78-L83: 内部路径直接放行（协议补全不应用）
+    if (startsWith($url, '?') || startsWith($url, '/') || startsWith($url, '#')) {
+        return $url;
+    }
+    $protocols = array_merge(['http', 'https'], $protocols);
+
+    // L87-L97: 提取 URL 前缀中的协议名
+    $scheme = get_url_scheme($url);
+    if (!empty($scheme) && in_array(strtolower($scheme), $protocols)) {
+        return $url;                    // 协议在白名单中 → 原样返回
+    } elseif (!empty($scheme)) {
+        return 'http://' . substr($url, strlen($scheme) + 1);
+        // ↑↑↑ 协议不在白名单中（如 javascript:）→ 替换为 http://
+    }
+    return 'http://' . $url;           // 无协议 → 前加 http://
+}
+```
+
+**协议处理矩阵：**
+
+| 输入 URL | `scheme` | 协议在白名单中 | 输出 URL |
+|----------|----------|---------------|----------|
+| `https://example.com` | `https` | 是 | `https://example.com` |
+| `example.com` | (空) | — | `http://example.com` |
+| `javascript:alert(1)` | `javascript` | 否 | `http://alert(1)` |
+| `magnet:?xt=urn:...` | `magnet` | 默认否（可配置） | 默认 `http://?xt=urn:...` |
+| `?/shaare/WDWyig` | (空) | 内部路径 | `?/shaare/WDWyig`（不变） |
+| `file:///C:/x.txt` | `file` | 否 | `http:///C:/x.txt` |
+
+### 12.5 尾斜杠处理：完全保留
+
+**整个导入路径对尾部斜杠不做任何处理。** 具体证据：
+
+1. 解析器正则 `/href="(.*?)"/i` 不区分 URL 尾斜杠
+2. `trim($url)` 仅删空白，不删 `/`
+3. `parse_url()` 保留 path 中的尾斜杠
+4. `unparse_url()` 直接拼接 parts，不做规范化
+5. `BookmarkArray::getByUrl()` 采用精确字符串哈希匹配
+
+因此，以下两个 URL 会被视为**完全不同**的条目：
+
+- `https://example.com/path`
+- `https://example.com/path/`
+
+### 12.6 查询参数与 fragment 清洗（非规范化）
+
+`Url::cleanup()`（[Url.php:L160-L165](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/Url.php#L160-L165)）会剥离 `$annoyingQueryParams` 中列出的参数：
+
+```php
+private static $annoyingQueryParams = [
+    'action_object_map=', 'action_ref_map=', 'action_type_map=',  // Facebook
+    'fb_', 'fb=', 'PHPSESSID=',                                    // PHP/Facebook
+    '__scoop',                                                     // Scoop.it
+    'utm_',                                                        // Google Analytics
+    'xtor=',                                                       // ATInternet
+    'campaign_',                                                   // 其他
+];
+```
+
+这会影响去重：导入时 `utm_*` 等参数被剥离，导致同一 URL 有无 utm 参数会被归并。例如：
+- 导入 A：`https://x.com/a?utm_source=twitter` → 存储为 `https://x.com/a`
+- 导入 B：`https://x.com/a` → 同样存储为 `https://x.com/a`，被判定为重复
+
+---
+
+## 13. 文件字符集探测完整函数链
+
+### 13.1 导入主流程中无字符集转换
+
+首先确认：在 Shaarli 自身的导入链中，**没有任何字符集探测与转换步骤**。
+
+```
+ImportController.php L73:  $data = (string)$file->getStream();
+                                        ↑ 原始文件二进制字节流，直接读入
+NetscapeBookmarkUtils.php L93:
+    $data = (string)$file->getStream();   // 同上，原样传递
+L95: preg_match('/<!DOCTYPE NETSCAPE...>/i', $data)
+     ↑ 正则直接对原始字节匹配，不做编码判断
+L124: $this->parser->parseString($data)
+     ↑ 原始字节交给第三方库，不经任何 iconv/mb_convert
+```
+
+任何字符集转换都必须在外部管道完成，或依赖 PHP 正则引擎对目标编码的兼容程度。
+
+### 13.2 解析库内部同样无字符集转换
+
+在 `NetscapeBookmarkDecoder` 内部检查：
+
+| 函数 | 是否涉及编码转换 |
+|------|-----------------|
+| `decode()` | 否，直接正则匹配字节 |
+| `sanitizeString()` | 否，仅删行/粘行/转义换行 |
+| `splitTagString()` | 使用 `strtolower()`（单字节），不进行 iconv |
+| `sanitizeTags()` | 使用 `ctype_alnum()`，其余保留原样 |
+| `parseBoolean()` | 正则匹配 TRUE_PATTERN / FALSE_PATTERN |
+| `parseDate()` / `normalizeDate()` | 纯数字处理 |
+
+**注意：** `sanitizeString()` 的步骤 3 会将 `<META ... charset=Windows-1252>` 这一行整行删除。如果浏览器导出文件中 `<META>` 行同时声明了 `CONTENT="text/html; charset=Windows-1252"`，在 `decode()` 开始执行时它已经不存在了，因此解析器内部**不可能**从该声明提取编码信息。
+
+### 13.3 字符集探测工具函数（存在于 Shaarli，但导入路径未调用）
+
+Shaarli 中存在两个字符集提取函数，但它们服务于**外链元数据抓取**场景（`MetadataRetriever`），而非书签导入：
+
+**1. `header_extract_charset()`** — [LinkUtils.php:L28-L36](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/LinkUtils.php#L28-L36)
+
+```php
+function header_extract_charset($header)
+{
+    preg_match('/charset=["\']?([^; "\']+)/i', $header, $match);
+    if (!empty($match[1])) {
+        return strtolower(trim($match[1]));
+    }
+    return false;
+}
+```
+
+用于从 HTTP 响应头 `Content-Type: text/html; charset=GBK` 中提取。
+
+**2. `html_extract_charset()`** — [LinkUtils.php:L45-L54](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/LinkUtils.php#L45-L54)
+
+```php
+function html_extract_charset($html)
+{
+    preg_match('#<meta .*charset=["\']?([^";\'>/]+)["\']? */?>#Usi', $html, $enc);
+    if (!empty($enc[1])) {
+        return strtolower($enc[1]);
+    }
+    return false;
+}
+```
+
+用于从 HTML `<META CHARSET="...">` 或 `<META HTTP-EQUIV="Content-Type" CONTENT="...;charset=...">` 中提取。
+
+它被调用在 `HttpUtils::getCurlDownloadCallback()`（[HttpUtils.php:L593-L594](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/HttpUtils.php#L593-L594)）中，仅在 cURL 抓取外部页面 metadata 时使用。
+
+### 13.4 实际的转换回退触发条件（MetadataRetriever 场景）
+
+在 [MetadataRetriever.php:L59-L67](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/MetadataRetriever.php#L59-L67) 中：
+
+```php
+if (!empty($title) && strtolower($charset) !== 'utf-8') {
+    $title = mb_convert_encoding($title, 'utf-8', $charset);
+}
+if (!empty($description) && strtolower($charset) !== 'utf-8') {
+    $description = mb_convert_encoding($description, 'utf-8', $charset);
+}
+if (!empty($tags) && strtolower($charset) !== 'utf-8') {
+    $tags = mb_convert_encoding($tags, 'utf-8', $charset);
+}
+```
+
+**回退条件（严格）：**
+1. `$charset` 必须非空（由 `header_extract_charset` 或 `html_extract_charset` 成功提取到）
+2. `strtolower($charset) !== 'utf-8'`
+3. `mb_convert_encoding` 支持该源编码（mbstring 扩展必须启用）
+
+**不回退的情况：**
+- `$charset === null` 或提取失败 → 按 UTF-8 原样处理，若实际为 GBK/Windows-1252 则会出现乱码
+- `$charset === 'utf-8'`（大小写不敏感）→ 不转换
+- mbstring 扩展未启用 → 报错或静默失败
+
+### 13.5 书签文件为 Windows-1252 / GBK 时的实际行为
+
+因为导入管道未进行任何 `mb_convert_encoding` 或 `iconv` 调用，实际表现如下：
+
+| 场景 | 导出文件编码 | DOCTYPE 匹配 | 英文字段 | 中文字段（标题/标签） |
+|------|------------|-------------|---------|---------------------|
+| 标准 Firefox / Chrome 导出 | UTF-8 | ✅ 匹配 | 正常 | 正常 |
+| 旧版 IE 导出 | Windows-1252 | ✅ 匹配（DOCTYPE 为 ASCII） | 正常 | 西欧重音字符可能乱码 |
+| 国内浏览器导出 | GBK / GB2312 | ✅ 匹配（DOCTYPE 为 ASCII） | 正常 | **中文乱码**——存储为 GBK 字节，系统按 UTF-8 解释 |
+| 导出带 BOM 的 UTF-8 | UTF-8 BOM | ✅ BOM 不影响正则 | 正常 | 正常 |
+
+**修复建议（当前缺失）：**
+在 `NetscapeBookmarkUtils::import()` L93 之后、L95 DOCTYPE 检查之前，插入以下逻辑可解决问题：
+
+```php
+$data = (string)$file->getStream();
+// 新增字符集探测与回退
+$charset = html_extract_charset($data);
+if ($charset && $charset !== 'utf-8' && function_exists('mb_convert_encoding')) {
+    $data = mb_convert_encoding($data, 'UTF-8', $charset);
+}
+```
+
+注意：需在 `sanitizeString()` 剥除 META 行**之前**执行探测。
+
+### 13.6 字符集探测优先级（若实现上述修复）
+
+```
+1. 从 <META> 中提取 charset:
+   /<meta .*charset=["\']?([^";\'>/]+)["\']? *\/?>/Usi
+   │
+   ├── 提取到 "utf-8" / "UTF-8" → 不转换
+   ├── 提取到 "windows-1252" / "cp1252" / "iso-8859-1" → mb_convert(..., 'UTF-8', 'Windows-1252')
+   ├── 提取到 "gbk" / "gb2312" / "gb18030" → mb_convert(..., 'UTF-8', 'GBK')
+   └── 其他编码 → mb_convert(..., 'UTF-8', $charset)
+
+2. 提取失败（或 mbstring 不可用）
+   └── 按原始字节继续解析（可能出现乱码）
+```
+
+---
+
+## 14. 关键代码索引（补充）
+
+### 第三方解析库核心（v4.0.0, commit aa024e5）
+
+- `NetscapeBookmarkParser::__construct()` — 默认上下文（KEEP_NESTED_TAGS=true）
+- `NetscapeBookmarkDecoder::decode()` — 逐行解析主循环（H3/DL 状态机）
+- `NetscapeBookmarkDecoder::sanitizeString()` — HTML 预处理（剥 META / 粘行 / 去注释）
+- `NetscapeBookmarkDecoder::splitTagString()` — **`strtolower()` 小写化唯一位置**
+- `NetscapeBookmarkDecoder::sanitizeTags()` — 文件夹名 → 标签数组清洗
+- `NetscapeBookmarkDecoder::flattenTagsList()` — 二维标签栈展平为一维链
+
+### URL 字段处理完整路径
+
+- [NetscapeBookmarkDecoder::decode() L163](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/vendor/shaarli/netscape-bookmark-parser/src/Encoder/NetscapeBookmarkDecoder.php) — 解析器中 URL 提取（不做 trim）
+- [Url::__construct() L65](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/Url.php#L62-L71) — **`trim($url)` 唯一位置** + 缺省 scheme 补全
+- [Url::removeFirefoxAboutReader()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/Url.php#L93-L100) — Firefox Reader 前缀剥除
+- [Url::cleanup()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/Url.php#L160-L165) — `utm_*`、`fb_*` 等恼人查询参数剥离
+- [whitelist_protocols()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/UrlUtils.php#L75-L106) — 协议白名单 + 无协议补 `http://`
+- [Bookmark::setUrl()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/Bookmark.php#L244-L253) — 整合 cleanup_url + whitelist_protocols
+
+### 字符集探测与回退
+
+- [html_extract_charset()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/LinkUtils.php#L45-L54) — 从 HTML meta 提取 charset
+- [header_extract_charset()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/bookmark/LinkUtils.php#L28-L36) — 从 HTTP Content-Type 提取 charset
+- [MetadataRetriever.php:L59-L67](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/http/MetadataRetriever.php#L59-L67) — **`mb_convert_encoding` 实际回退位置**（仅外链抓取场景，未用于导入）
+- [NetscapeBookmarkUtils.php:L93](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/netscape/NetscapeBookmarkUtils.php#L93) — 导入时文件字节流读取（**当前无字符集转换**）
+
+### 关键代码索引
 
 ### 导入主流程
 - [ImportController::import()](file:///d:/fz/0601-1/solo-dogfeeding/code/77-Shaarli/application/front/controller/admin/ImportController.php#L49-L81)
