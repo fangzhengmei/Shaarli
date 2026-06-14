@@ -1205,11 +1205,89 @@ OR 标签路径 (substr + tag2matchterm):
 | tag2matchterm | `'*'` → `[^ ]*?` | `*` 转为通配符 |
 | 正则片段 | `(?=.*(?:^| )pro[^ ]*?(?:$| ))` | 匹配 `pro` 开头的标签 |
 
-#### 设计意图与不一致性
+#### 设计意图 vs Bug 决断
 
-OR 路径不剥 `+`/`-` 前缀的原因可能是：
-- OR 语法设计为"匹配这些标签中的任意一个"，如果标签名本身就包含 `+` 或 `-` 前缀，需要精确匹配
-- 但这与 AND 路径的行为不一致，可能导致用户困惑
+**结论：OR 路径不剥 `+`/`-` 前缀是 BUG，不是设计意图。**
+
+证据链：
+
+1. **tag2matchterm 的文档注释自相矛盾**
+
+   [BookmarkFilter.php#L502-L510](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L502-L510)：
+
+   ```
+    * generate a regex match term fragment out of a tag
+    *
+    * @param string $tag to to generate regexs from. This function
+    * assumes any leading flags ('-', '~') have been stripped. The
+    * wildcard flag '*' is expanded by this function and any other
+    * regex characters are escaped.
+   ```
+
+   注释明确写着：**assumes any leading flags ('-', '~') have been stripped**（假设所有 `-`/`~` 前导标志已被剥离）。但 OR 路径调用 `tag2matchterm` 时**没有**剥离 `+`/`-` 前缀，违反了自身的前置条件约定。
+
+   注意：注释提到了 `'-'` 和 `'~'`，没提到 `'+'`，但 `'+'` 前缀在 tag2regex 中也是被剥离的标志，逻辑上应同等处理。
+
+2. **与 AND 路径行为不一致**
+
+   | 搜索 | AND 路径 (tag2regex) | OR 路径 (直接 tag2matchterm) |
+   |-----|---------------------|----------------------------|
+   | `+foo` | 剥 `+` → 匹配 `foo` | `~+foo` → **不剥** → 匹配字面量 `\+foo` |
+   | `-bar` | 剥 `-` → 生成负向前瞻，排除 `bar` | `~-baz` → **不剥** → 匹配字面量 `\-baz` |
+
+   同一符号在两条路径中语义完全不同，没有任何文档说明这种差异，不符合设计一致性原则。
+
+3. **用户心智模型不支持字面量 `+`/`-` 标签名**
+
+   Bookmark 模型的 `setTags` 在保存时会**去除前导 `-`**：
+
+   [Bookmark.php#L353-L363](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/Bookmark.php#L353-L363)：
+
+   ```php
+   $this->tags = array_map(function (string $tag): string {
+       return $tag[0] === '-' ? substr($tag, 1) : $tag;
+   }, tags_filter($tags, ' '));
+   ```
+
+   也就是说，标签 `-foo` 保存为 `foo`，**根本不可能存在以 `-` 开头的标签**。因此 OR 路径匹配字面量 `-baz` 永远不可能命中任何真实保存的标签，是完全无效的行为。
+
+   对于 `+` 前缀：保存时不会去除 `+`，但 `+` 在 AND 路径中作为语法糖（显式 AND 标志）被剥离，用户不太可能特意保存 `+` 开头的标签名。即使有，也应该通过转义语法（如 `++foo`）匹配，而不是让 OR 路径默认匹配字面量。
+
+4. **`~` 前缀本身就是 OR 语法标志**
+
+   `~` 前缀在 `tag2regex` 中被早返回（`$tag[0] === "~"` → `''`），说明系统明确将 `~` 定义为语法标志。用户输入 `~+foo` 的心智模型是 "OR 匹配 +foo"（即 OR 匹配 foo，+ 是多余的显式 AND 标志），而不是 "匹配字面量 +foo"。
+
+**决断依据汇总**：
+
+| 依据 | 结论 |
+|-----|------|
+| tag2matchterm 文档注释说 `-`/`~` 前缀应该已剥离 | ✅ 违反前置条件 |
+| 与 AND 路径前缀剥离行为不一致 | ✅ 不一致性 |
+| `-` 前缀标签根本不存在（setTags 会去除） | ✅ 匹配目标不存在 |
+| 用户心智模型预期 `~` 是 OR 标志，不改变 `+`/`-` 原有语义 | ✅ 违反心智模型 |
+| `~` 前缀在 tag2regex 中被定义为语法标志 | ✅ 语义应统一 |
+
+**决断**：OR 路径不剥 `+`/`-` 前缀是 **BUG**，应修复。
+
+**修复建议**：在 `substr($tag, 1)` 剥掉 `~` 之后，还应该复用与 `tag2regex` 相同的前缀剥离逻辑（至少剥 `+`），`-` 的话在 OR 场景下语义不明确（排除没有 OR 排除的语法，应丢弃或忽略）。
+
+```php
+// 修复思路：
+$orTags = array_filter(array_map(function ($tag) {
+    if (!startsWith($tag, '~')) return null;
+    $orTag = substr($tag, 1);
+    // 复用 tag2regex 的前缀剥离：先剥 +
+    if (strlen($orTag) > 0 && $orTag[0] === '+' && isset($orTag[1])) {
+        $orTag = substr($orTag, 1);
+    }
+    // - 前缀在 OR 中无意义，视为标签一部分则永远匹配不到
+    // 因为保存时 setTags 会去前导 -，所以这里可以剥掉
+    if (strlen($orTag) > 0 && $orTag[0] === '-') {
+        $orTag = substr($orTag, 1);
+    }
+    return $orTag === '' ? null : $orTag;
+}, $inputTags));
+```
 
 | 搜索 | 搜索意图 | 实际匹配 |
 |-------|---------|---------|
@@ -1220,336 +1298,407 @@ OR 路径不剥 `+`/`-` 前缀的原因可能是：
 
 ---
 
-### 11.3 strtolower 对 Unicode 大小写合并的反例
+### 11.3 strtolower 对 Unicode 大小写合并的反例（修正版）
 
-[BookmarkFileService::bookmarksCountPerTag](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFileService.php#L340-L345) 第341行使用 `strtolower($tag)` 进行大小写合并，但 `strtolower` 是**单字节函数**，只能正确处理 ISO-8859-1 (Latin-1) 字符，对 Unicode 字符处理不正确。
+[BookmarkFileService::bookmarksCountPerTag](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFileService.php#L340-L345) 第341行使用 `strtolower($tag)` 进行大小写合并。
 
-#### strtolower vs mb_convert_case 对比
+**PHP `strtolower()` 的实际行为：只修改 ASCII 大写字母 A-Z (0x41-0x5A) → a-z (0x61-0x7A)**。
 
-| 函数 | 编码感知 | 处理范围 |
-|------|---------|---------|
-| `strtolower` | ❌ 单字节 | 仅 ISO-8859-1 (U+0000 ~ U+00FF) |
-| `mb_convert_case(MB_CASE_LOWER)` | ✅ Unicode | 全部 Unicode 字符 |
+之前的分析错误：认为 Latin-1 字符 É (U+00C9, ISO-8859-1 中 0xC9) 会被 strtolower 转成 é。这只有在 PHP 源码编译时 locale 被设为非 C 并且内部编码是单字节 ISO-8859-1 时才可能发生。**在 UTF-8 编码下，É 的字节序列是 C3 89，两个字节都不在 0x41-0x5A 范围，strtolower 完全不变。**
 
-#### 反例 1：Étude (法语"练习曲")
+#### strtolower 真实修改范围验证
 
-```
-书签1 标签: "Étude"  (U+00C9 tude)
-书签2 标签: "étude"  (U+00E9 tude)
-
-strtolower("Étude"):
-  É (U+00C9) 在 ISO-8859-1 范围内 (0xC9)
-  strtolower(0xC9) 映射到 0xE9 é，**单字节正确 ✓
-
-等等，É 实际上在 ISO-8859-1 中存在！
-ISO-8859-1: É = 0xC9, é = 0xE9
-strtolower 能正确转换 É → é ✓
-
-但更复杂的 Unicode 字符呢？
-```
-
-**真正的反例：带重音符号的大写字母不在 Latin-1 范围时：**
-
-| 字符 | Unicode | strtolower 结果 | mb_convert_case 结果 | 是否一致？ |
-|-----|---------|---------------|----------------------|-----------|
-| É | U+00C9 | é (U+00E9) | é (U+00E9) | ✅ 一致（在 Latin-1 范围） |
-| é | U+00E9 | é | é | ✅ |
-| ẞ | U+1E9E)（德语大写 ß) | ẞ (不变，因为 U+1E9E 不在 Latin-1) | ss (U+0073 U+0073) | ❌ 不一致 |
-| ß | U+00DF) | ß (不变，strtolower 对已经是小写) | ß | ✅ 一致（但大写是 SS) |
-| Ğ | U+011E)（土耳其语 G 带-breve) | Ğ (不变，U+011E 不在 Latin-1) | ğ (U+011F) | ❌ 不一致 |
-| ğ | U+011F) | ğ | ğ | ✅ |
-| Σ | U+03A3)（希腊大写 Sigma) | Σ (不变，U+03A3 不在 Latin-1) | σ (U+03C3) 或 ς (U+03C2) | ❌ 不一致 |
-| σ | U+03C3) | σ | σ | ✅ |
-
-**反例 2：德语 ß/SS 大小写对
+PHP 官方文档说明：`strtolower` returns string with all ASCII alphabetic characters converted to lowercase.
 
 ```
-书签1 标签: "Straße"  (含 ß U+00DF)
-书签2 标签: "STRASSE"  (全大写)
+strtolower 逐字节处理，仅当字节值 ∈ [0x41, 0x5A] 时 +0x20
 
-处理流程:
-  strtolower("Straße")  →  "straße"  (ß 保持不变，strtolower 不认识 Unicode 小写字符)
-  strtolower("STRASSE") →  "strasse"  (A-Z → a-z)
+0x41('A')→0x61('a')  0x42('B')→0x62('b')  ...  0x5A('Z')→0x7A('z')
 
-结果:
-  $caseMapping["straße"]  →  "Straße"
-  $caseMapping["strasse"] 不存在！
-  两个标签被当作不同标签计数，计数分别累计
-
-但 mb_convert_case:
-  mb_convert_case("Straße", MB_CASE_LOWER, 'UTF-8')  →  "straße"
-  mb_convert_case("STRASSE", MB_CASE_LOWER, 'UTF-8')  →  "strasse"
-  注意：ß 的大写是 SS，所以 STRASSE 小写还是 strasse
-
-实际上 ß 和 SS 小写不同，这是语言特性。
+其他所有字节值不变。
 ```
 
-**反例 3：土耳其语 Ğ/ğ
+#### UTF-8 编码下的字符字节范围
+
+| 字符类别 | 典型 UTF-8 字节 | 字节值范围 | strtolower 影响？ |
+|---------|----------------|-----------|-----------------|
+| ASCII 大写 A-Z | 41-5A | 65-90 | ✅ 转为小写 |
+| ASCII 其他 | 00-40, 5B-7F | 0-64, 91-127 | ❌ 不变 |
+| Latin-1 大写（UTF-8 两字节） | C3 80 ~ C3 9E | C3=195, 80~9E | ❌ C3 不在 41-5A，全部不变 |
+| Latin-1 小写（UTF-8 两字节） | C3 A0 ~ C3 BF | C3=195, A0~BF | ❌ 同上不变 |
+| 扩展拉丁 Ğ (U+011E) | C4 9E | C4=196, 9E=158 | ❌ 不变 |
+| 希腊 Σ (U+03A3) | CE A3 | CE=206, A3=163 | ❌ 不变 |
+| 西里尔 А (U+0410) | D0 90 | D0=208, 90=144 | ❌ 不变 |
+
+**关键修正**：在 UTF-8 编码下，所有带重音符号的拉丁字母、希腊字母、西里尔字母等非 ASCII 字符，其 UTF-8 字节值**全部大于 0x7F**，不可能落入 0x41-0x5A 范围。因此 **`strtolower` 对任何 Unicode 非 ASCII 字符完全不起作用**，而不仅仅是"超出 Latin-1 范围的字符"。
+
+#### strtolower vs mb_convert_case 对比（修正）
+
+| 函数 | 编码感知 | 修改范围 | 字节级行为 |
+|------|---------|---------|-----------|
+| `strtolower` | ❌ 无，逐字节 | 仅 0x41-0x5A → 0x61-0x7A | `byte >= 'A' && byte <= 'Z' ? byte + 0x20 : byte` |
+| `mb_convert_case(MB_CASE_LOWER)` | ✅ Unicode 感知 | 全部 Unicode 字符按 Unicode CaseFolding 映射 | 多字符序列替换（如 Σ→σ/ς, İ→i, ẞ→ss） |
+
+#### 反例分类（修正）
+
+**第 0 类：纯 ASCII（无问题）**
+
+| 字符 | UTF-8 字节 | strtolower | mb | 结果 |
+|-----|-----------|-----------|-----|------|
+| HELLO | 48 45 4C 4C 4F | 68 65 6C 6C 6F | 同左 | ✓ 一致 |
+| hello | 68 65 6C 6C 6F | 不变 | 同左 | ✓ 一致 |
+
+**第 1 类：Latin-1 带重音大写字母（U+00C0 ~ U+00DE）—— 之前分析错误，实际也不合并！**
+
+| 标签对 | Unicode | UTF-8 字节 | strtolower key | mb_convert_case key | 是否合并？ |
+|-------|---------|-----------|---------------|-------------------|-----------|
+| "Étude" / "étude" | U+00C9 / U+00E9 | C3 89 74... / C3 A9 74... | **不同**：C3 89... / C3 A9... | 相同：étude... | ❌ 2 个条目 |
+| "À propos" / "à propos" | U+00C0 / U+00E0 | C3 80... / C3 A0... | **不同** | 相同：à... | ❌ 2 个条目 |
+| "Österreich" / "österreich" | U+00D6 / U+00F6 | C3 96... / C3 B6... | **不同** | 相同：ö... | ❌ 2 个条目 |
+| "Ñandú" / "ñandú" | U+00D1 / U+00F1 | C3 91... / C3 B1... | **不同** | 相同：ñ... | ❌ 2 个条目 |
+
+这意味着法语、西班牙语、德语等使用 Latin-1 重音字母的用户，大小写标签**全部不能合并**，而不是"在 Latin-1 范围内正确"。
+
+**实测（Node.js 模拟 PHP strtolower）**：
 
 ```
-书签1 标签: "Ğüne"  (Ğ U+011E)
-书签2 标签: "ğüne"  (ğ U+011F)
+用 strtolower 合并:
+  Étude          次数: 1   ← 大写不转小写，单独条目
+  étude          次数: 1   ← 又一个单独条目
+  STRAßE         次数: 2   ← A-Z 部分被合并了 (STRA→stra)
+  ПРИВЕТ         次数: 1   ← 西里尔字母完全不变
+  привет         次数: 1   ← 又一个单独条目
+  HELLO          次数: 2   ← ASCII 正常合并
+→ 合并后的标签数: 6 (应该是 4)
 
-strtolower("Ğüne")  →  "Ğüne"  (Ğ 保持不变！U+011E 不在 Latin-1)
-strtolower("ğüne")  →  "ğüne"
-
-结果:
-  $caseMapping["Ğüne"]  →  "Ğüne"
-  $caseMapping["ğüne"]  →  "ğüne"
-  两个标签被当作不同标签 ❌
-
-mb_convert_case 正确:
-  mb_convert_case("Ğüne", MB_CASE_LOWER, 'UTF-8')  →  "ğüne"
-  mb_convert_case("ğüne", MB_CASE_LOWER, 'UTF-8')  →  "ğüne"
-  正确合并为同一个标签 ✓
+用 mb_convert_case 合并:
+  Étude          次数: 2
+  STRAßE         次数: 2
+  ПРИВЕТ         次数: 2
+  HELLO          次数: 2
+→ 合并后的标签数: 4 (正确)
 ```
 
-**反例 4：希腊语 Σ/σ/ς
+**第 2 类：Latin 扩展（U+0100+）—— 不合并**
 
-```
-书签1 标签: "Σύνταξη"  (Σ U+03A3)
-书签2 标签: "σύνταξη"  (σ U+03C3)
+| 标签对 | Unicode | UTF-8 字节 | strtolower | mb | 是否合并？ |
+|-------|---------|-----------|-----------|-----|-----------|
+| "Ğüne" / "ğüne" | U+011E / U+011F | C4 9E... / C4 9F... | **不同** | 相同：ğüne | ❌ 2 个条目 |
+| "İstanbul" / "istanbul" | U+0130 / U+0069 | C4 B0... / 69... | **不同** | 相同：istanbul* | ❌ |
 
-strtolower("Σύνταξη")  →  "Σύνταξη"  (Σ 保持不变！)
-strtolower("σύνταξη")  →  "σύνταξη"
+*土耳其语 İ→i 是特殊语言规则
 
-结果:
-  两个标签被当作不同标签 ❌
+**第 3 类：希腊字母 / 西里尔字母等非拉丁脚本 —— 完全不合并**
 
-mb_convert_case 正确:
-  mb_convert_case("Σύνταξη", MB_CASE_LOWER, 'UTF-8')  →  "σύνταξη"
-  正确合并 ✓
-```
+| 标签对 | Unicode | UTF-8 首字节 | strtolower 首字节 | mb 首字节 | 是否合并？ |
+|-------|---------|-------------|-----------------|----------|-----------|
+| "Σύνταξη" / "σύνταξη" | U+03A3 / U+03C3 | CE A3 / CF 83 | CE A3 / CF 83 **不同** | CF 83 / CF 83 相同 | ❌ |
+| "ПРИВЕТ" / "привет" | U+041F~ / U+043F~ | D0 9F~ / D0 BF~ | D0 9F~ / D0 BF~ **不同** | D0 BF~ / D0 BF~ 相同 | ❌ |
+| "Γεια" / "γεια" | U+0393 / U+03B3 | CE 93 / CE B3 | CE 93 / CE B3 **不同** | CE B3 / CE B3 相同 | ❌ |
 
-#### 实际影响范围
+**第 4 类：特殊大小写转换（语言相关）**
 
-| 语言 | 受影响字符示例 | 影响 |
-|-----|---------------|------|
-| 德语 | ß/SS, ẞ | 大小写不合并 |
-| 土耳其语 | Ğ/ğ, İ/i, I/ı | 大量字符不合并 |
-| 希腊语 | Σ/σ/ς | 大小写不合并 |
-| 俄语 | А/а, П/п | 所有西里尔字母 |
-| 中文/日文 | 无大小写概念 | 无影响 |
-| 法语/西班牙语 | É/é, Ñ/ñ | 在 Latin-1 范围内的字符正确，扩展字符不正确 |
+| 标签对 | Unicode 说明 | strtolower | mb_convert_case | 是否合并？ |
+|-------|-------------|-----------|----------------|-----------|
+| "STRAßE" / "straße" | ß 大写是 SS | STRA**ßE** 中 A-Z 被转 (STRA→stra), ß 不变，结果: **straße** vs **straße** → 碰巧相同 | 同左 | ✓ 碰巧合并* |
+| "STRASSE" / "straße" | SS 小写是 ss | strasse vs straße | 同 strtolower | ❌ 两个条目 |
+| "ẞ" (U+1E9E 新德语大写 ß) / "ß" | ẞ 新大写字母 | C4 9E → 不变, C3 9F → 不变, **不同** | ss / ß，**也不同** | ❌ 都不合并 |
 
-对于 Shaarli 标签云来说，这个 bug 影响非 Latin-1 脚本的用户。
+*STRAßE 和 straße 碰巧因为 STRA→stra (A-Z 转换) + ß 不变而得到相同字节序列 strasse，这是 strtolower "歪打正着" 而不是正确处理。
+
+#### 实际影响范围（修正）
+
+| 语言 | 受影响示例 | 影响程度 |
+|-----|-----------|---------|
+| **英语（纯 ASCII）** | HELLO/hello | ✅ 无影响 |
+| **法语** | Étude/étude, À/à, Ê/ê, Ô/ô | 🔴 **全部不合并**（之前认为 Latin-1 没问题是错的） |
+| **西班牙语** | Ñ/ñ, Ú/ú, Í/í | 🔴 全部不合并 |
+| **德语** | Ä/ä, Ö/ö, Ü/ü, ß/SS | 🔴 含变音字母的不合并，STRASSE/straße 也不合并 |
+| **葡萄牙语** | Ã/ã, Õ/õ, É/é | 🔴 全部不合并 |
+| **土耳其语** | Ğ/ğ, İ/i, I/ı, Ş/ş | 🔴 大量字符不合并 |
+| **希腊语** | Α/α, Σ/σ/ς, Η/η | 🔴 完全不合并 |
+| **俄语/乌克兰语** | А/а, П/п, Р/р 等所有西里尔字母 | 🔴 完全不合并 |
+| **阿拉伯语/希伯来语/中文/日文** | 无大小写概念 | ✅ 无影响 |
+
+**结论**：之前的分析严重低估了影响范围。不仅非 Latin-1 的字符受影响，**所有使用重音符号的 Latin-1 语言（法语、西班牙语、德语等）都受到完全影响**，因为 UTF-8 编码下这些字母的字节都不在 0x41-0x5A 范围。英语用户无影响，非英语西欧、东欧、南欧、俄语用户全部受影响。
 
 ---
 
-### 11.4 真实运行正则匹配测试（预期输出）
+### 11.4 实测验证结果（Node.js 模拟 PHP 行为，与 PHP PCRE 语法一致）
 
-> ⚠️ 环境未安装 PHP，以下为预期输出推导结果。可执行命令：`php -r '...'
+> ⚠️ 环境中 Docker Hub 不可达，无法直接运行 `docker run php:cli`。使用 Node.js 模拟 PHP 行为：
+> - 正则语法：JavaScript RegExp 与 PHP PCRE 核心语法一致（前瞻、非捕获组、字符类），测试结果可移植
+> - strtolower 模拟：严格按 `0x41-0x5A → 0x61-0x7A` 字节级规则
+> - mb_convert_case 模拟：使用 `String.prototype.toLocaleLowerCase()`
+
+**可复现命令**：
+```bash
+# 有 Docker 时直接运行
+docker run --rm -v "$(pwd)":/app -w /app php:cli php test_bookmarkfilter.php
+
+# 或使用 Node.js（本环境已验证）
+node test_regex_node.js
+```
 
 #### 测试 1：AND + 排除组合
 
-```php
-$re = '/^(?=.*(?:^| )linux(?:$| ))(?!.*(?:^| )windows(?:$| )).*$/i';
-$tags1 = 'linux ubuntu';
-$tags2 = 'linux windows';
-$tags3 = 'ubuntu windows';
-var_dump(preg_match($re, $tags1));  // int(1) ✓
-var_dump(preg_match($re, $tags2));  // int(0) ✓
-var_dump(preg_match($re, $tags3));  // int(0) ✓
+```
+正则: /^(?=.*(?:^| )linux(?:$| ))(?!.*(?:^| )windows(?:$| )).*$/i
+  linux ubuntu  → ✓
+  linux windows → ✗
+  ubuntu windows → ✗
 ```
 
-**预期输出**：
-```
-int(1)
-int(0)
-int(0)
-```
+#### 测试 2：AND + OR 组合 (linux ~ubuntu ~debian)
 
-#### 测试 2：AND + OR 组合
-
-```php
-$re = '/^(?=.*(?:^| )linux(?:$| ))(?=.*(?:^| )(ubuntu|debian)(?:$| )).*$/i';
-$tags1 = 'linux ubuntu';       // int(1) ✓
-$tags2 = 'linux debian';       // int(1) ✓
-$tags3 = 'linux gentoo';       // int(0) ✓
-$tags4 = 'ubuntu debian';    // int(0) ✓
+```
+正则: /^(?=.*(?:^| )linux(?:$| ))(?=.*(?:^| )(ubuntu|debian)(?:$| )).*$/i
+括号平衡: 开=7, 合=7 → ✓ 平衡
+  linux ubuntu  → ✓
+  linux debian  → ✓
+  linux gentoo  → ✗ (OR 都不匹配)
+  ubuntu debian → ✗ (缺 linux AND)
 ```
 
-**预期输出**：
+#### 测试 3：~.draft 隐私旁路 (visibility=public)
+
 ```
-int(1)
-int(1)
-int(0)
-int(0)
-```
-
-#### 测试 3：~.draft 隐私旁路验证
-
-```php
-// visibility=public，搜索 ~.draft
-$re = '/^(?=.*(?:^| )(\.draft)(?:$| )).*$/i';
-$tags1 = 'linux .draft';     // int(1) ⚠️ 匹配到隐藏标签
-$tags2 = 'linux draft';        // int(0) ✓ 不匹配普通 draft
-$tags3 = '.draft';            // int(1) ⚠️ 匹配到隐藏标签
-
-// 正常情况：搜索 .draft（public）
-// array_filter 移除 .draft，返回空数组，搜索结果为空
+正则: /^(?=.*(?:^| )(\.draft)(?:$| )).*$/i
+括号平衡: 开=4, 合=4 → ✓ 平衡
+  linux .draft  → ⚠️  MATCH! (隐藏标签泄露)  ← 漏洞确认
+  .draft        → ⚠️  MATCH! (隐藏标签泄露)  ← 漏洞确认
+  linux draft   → ✗ ✓ (不匹配普通标签)
 ```
 
-**预期输出**：
-```
-int(1)   ⚠️ 隐私漏洞：公开书签含 .draft 被搜到
-int(0)
-int(1)   ⚠️
-```
+漏洞确认：未登录用户搜索 `~.hidden_tag_name` 可匹配公开书签中的隐藏标签。
 
-#### 测试 4：通配符匹配
+#### 测试 4：~+foo (OR +foo，不剥前缀)
 
-```php
-$re = '/^(?=.*(?:^| )pro[^ ]*?(?:$| )).*$/i';
-$tags1 = 'programming';       // int(1) ✓
-$tags2 = 'project';           // int(1) ✓
-$tags3 = 'pro';                 // int(1) ✓
-$tags4 = 'apropos';           // int(0) ✓ 必须是完整标签
 ```
-
-**预期输出**：
-```
-int(1)
-int(1)
-int(1)
-int(0)
+正则: /^(?=.*(?:^| )(\+foo)(?:$| )).*$/i
+括号结构:
+  层0 (?=.*(?:^| )(\+foo)(?:$| ))       前瞻外壳
+    层1   (?:^| )        行首/分隔符
+    层1   (\+foo)        +foo 捕获组（+被转义，字面量）
+    层1   (?:$| )        行尾/分隔符
+括号平衡: 开=4, 合=4 → ✓ 平衡
+  +foo bar → MATCH (字面量 +foo)
+  foo bar  → ✗ ❌ 用户预期应该匹配 foo，但 OR 路径不剥 +
 ```
 
-#### 测试 5：链式前缀 ~+foo 匹配
+**代码证据**：`setTags` 保存标签时去除前导 `-`，所以 `~-baz` 匹配字面量 `-baz` 的目标标签**根本不可能存在**。验证：
 
-```php
-// 搜索 ~+foo
-$re = '/^(?=.*(?:^| )(\+foo)(?:$| )).*$/i';
-$tags1 = '+foo bar';           // int(1) ✓ 匹配字面量 +foo
-$tags2 = 'foo bar';           // int(0) ❌ 用户预期匹配 foo
+```
+正则: /^(?=.*(?:^| )(\-baz)(?:$| )).*$/i
+  -baz qux → MATCH (但这种标签不可能被保存！因为 setTags 会把 -baz 变成 baz)
+  baz qux  → ✗ ❌ 用户预期匹配 baz
 ```
 
-**预期输出**：
+但用户实际保存的是 `baz`，所以 `~-baz` **永远不会匹配任何东西**，属于无效输入静默失败。
+
+#### 测试 5：~pro* 通配符
+
 ```
-int(1)
-int(0)
-```
-
-#### 测试 6：Unicode 大小写测试
-
-```php
-$re = '/^(?=.*(?:^| )étude(?:$| )).*$/i';
-$tags1 = 'Étude';              // int(1) ✓ 正则 i 标志不区分大小写
-$tags2 = 'étude';              // int(1) ✓
-
-// 但 strtolower 合并测试
-$caseMapping = [];
-$tag1 = 'Étude';
-$tag2 = 'étude';
-$caseMapping[strtolower($tag1)] = $tag1;  // "étude" => "Étude"
-$caseMapping[strtolower($tag2)] = $tag2;  // "étude" => "étude" （覆盖）
-// 结果：$caseMapping["étude"] = "étude"，正确合并 ✓
-// 但如果是希腊语 Σ
-$tag3 = 'Σύνταξη';
-$caseMapping[strtolower($tag3)] = $tag3;  // "Σύνταξη" => "Σύνταξη" （Σ 不变）
-$tag4 = 'σύνταξη';
-$caseMapping[strtolower($tag4)] = $tag4;  // "σύνταξη" => "σύνταξη"
-// 结果：两个条目，未合并 ❌
+正则: /^(?=.*(?:^| )(pro[^ ]*?)(?:$| )).*$/i
+括号平衡: 开=4, 合=4 → ✓ 平衡
+  programming → ✓
+  project     → ✓
+  pro         → ✓
+  apropos     → ✗ ✓ (必须是完整标签，不匹配单词内部)
 ```
 
-**预期输出**：
+#### 测试 6：strtolower 字节级验证（关键修正）
+
 ```
-int(1)
-int(1)
+====== 字节级对比 ======
+ASCII HELLO:  48 45 4C 4C 4F → 68 65 6C 6C 6F (A-Z 被修改) ✓
+
+Étude (U+00C9):
+  原始 UTF-8: C3 89 74 75 64 65
+  strtolower: C3 89 74 75 64 65  ← C3=195 不在 41-5A  → **不变** ❌
+  mb_lower:   C3 A9 74 75 64 65  ← 正确转为 é (U+00E9)
+
+À propos (U+00C0):
+  原始 UTF-8: C3 80 20 70 72 6F 70 6F 73
+  strtolower: C3 80 20 70 72 6F 70 6F 73  ← **不变** ❌
+  mb_lower:   C3 A0 20 70 72 6F 70 6F 73  ← 正确
+
+ĞÜNE (U+011E U+00DC):
+  原始 UTF-8: C4 9E C3 9C 4E 45
+  strtolower: C4 9E C3 9C 6E 65  ← C4/C3 不变，只有 4E→6e, 45→65  ❌
+  mb_lower:   C4 9F C3 BC 6E 65  ← Ğ→ğ, Ü→ü 全部正确
+
+ПРИВЕТ (俄语, U+0410-042F):
+  原始: D0 9F D0 A0 D0 98 D0 92 D0 95 D0 A2
+  strtolower: **完全不变**，所有字节都不在 41-5A ❌
+  mb_lower:   D0 BF D1 80 D0 B8 D0 B2 D0 B5 D1 82  ✓ 全部小写化
 ```
 
 ---
 
-### 11.5 三路搜索与 bookmarksCountPerTag 完整协作
+### 11.5 BookmarkFilter vs BookmarkFileService：事实行为对照
 
-#### filterFulltext 三路搜索执行流程图：
+#### BookmarkFilter：纯粹的过滤层
 
-```
-用户输入: searchterm='hello "world code" -php
-    │
-    ▼ mb_convert_case(..., MB_CASE_LOWER, 'UTF-8')
-    │  → 'hello "world code" -php'
-    │
-    ├─ 精确短语提取: /"([^"]+)"/
-    │   preg_match_all → $exactSearch = ['world code']
-    │
-    ├─ 剩余部分: preg_replace 去掉精确短语 → 'hello  -php'
-    │   explode(' ') → ['hello', '', '-php']
-    │
-    ├─ 分离 AND / 排除:
-    │   $andSearch = ['hello']
-    │   $excludeSearch = ['php']
-    │
-    ▼ 遍历书签:
-    │
-    ├─ buildFullTextSearchableLink:
-    │   title\description\url\tags 全部小写化
-    │
-    ├─ 精确搜索: mb_strpos($content, 'world code')
-    │   返回位置 → 记录 $foundPositions
-    │
-    ├─ AND 搜索: mb_strpos($content, 'hello')
-    │   返回位置 → 记录 $foundPositions
-    │
-    └─ 排除搜索: strpos($content, 'php') === false
-    │
-    └─ 全部命中 → 设置 search_highlight → 加入结果
-```
+[BookmarkFilter](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php) 的职责是**对给定书签集合执行匹配过滤**，不涉及：
+- 不关心当前登录状态（通过参数 `$visibility` 传入）
+- 不缓存/修改数据
+- 不做计数/分页/排序
+- 不做插件调用以外的副作用
 
-#### bookmarksCountPerTag 完整流程图：
+**核心事实行为**：
+
+| 方法 | 输入 | 行为 | 典型输出 |
+|-----|------|-----|---------|
+| `filter($type, $terms, $casesensitive, $visibility, $untaggedonly)` | 过滤类型标志位 | 路由分发到具体 filter 方法 | Bookmark[] |
+| `filterTags($tags, $casesensitive, $visibility)` | 标签字符串/数组 | 构建正则，preg_match 标签字符串+描述 hashtag | Bookmark[] |
+| `filterFulltext($searchterms, $visibility)` | 全文搜索词 | 三路（精确/AND/排除）mb_strpos/strpos 扫描 | Bookmark[]，设置 `search_highlight` 附加内容 |
+| `filterUntagged($visibility)` | 可见性 | `count(getTags()) === 0` | Bookmark[] |
+| `filterHash($hash, $visibility)` | 哈希值 | 精确匹配 shortUrl | Bookmark (单条) |
+
+**三路搜索事实顺序**（[BookmarkFilter.php#L276-L290](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L276-L290)）：
 
 ```
-调用: bookmarksCountPerTag(['linux'], 'all')
+foreach ([$exactSearch, $andSearch] as $search) {
+    for ($i = 0; $i < count($search) && $found !== false; $i++) {
+        $found = mb_strpos($content, $search[$i]);   ← 第1路+第2路
+        if ($found === false) break;
+        $foundPositions[] = [...];                    ← 记录高亮位置
+    }
+}
+
+for ($i = 0; $i < count($excludeSearch) && $found !== false; $i++) {
+    $found = strpos($content, $excludeSearch[$i]) === false;  ← 第3路，strpos
+}
+```
+
+执行语义：
+1. 精确短语**全部**命中（AND 语义，全部都要存在）→ 记录位置
+2. AND 关键词**全部**命中（AND 语义，全部都要存在）→ 记录位置
+3. 排除词**全部不出现**（NOT AND 语义，一个都不能存在）
+4. 只要有一步失败 → `$found = false` → `break` → 该书签被排除
+
+**tag2regex 前缀剥离事实顺序**（[BookmarkFilter.php#L488-L496](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFilter.php#L488-L496)）：
+
+```php
+if ($tag[0] === "+" && $tag[1]) {
+    $tag = substr($tag, 1);   // 第1步：只剥第1字符为 '+' 的情况
+}
+if ($tag[0] === "-") {
+    $tag = substr($tag, 1);   // 第2步：剥处理后的字符串第1字符为 '-'
+    $negate = true;
+}
+```
+
+输入 `"+-foo"`：
+1. `$tag[0]='+'` 且 `$tag[1]='-'` 为真 → `substr(1)` → `'-foo'`
+2. `$tag[0]='-'` → `substr(1)` → `'foo'`, `negate=true`
+3. 结果：排除 `foo` ✓
+
+输入 `"-+bar"`：
+1. `$tag[0]='-'` 不是 `'+'` → 跳过
+2. `$tag[0]='-'` → `substr(1)` → `'+bar'`, `negate=true`
+3. tag2matchterm(`'+bar'`) → `preg_quote('+')` → `'\+bar'`
+4. 结果：排除字面量 `+bar` ❌（语义反直觉）
+
+**结论**：只有 `+` 必须是**原始第一个字符**才会被剥。`-+bar` 这种 `-` 在前的情况，后续的 `+` 不被剥，成为标签名的一部分。
+
+#### BookmarkFileService：业务编排层
+
+[BookmarkFileService](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFileService.php) 的职责是**业务流程编排**：
+- 关心登录状态 `$this->isLoggedIn`
+- 从文件加载/保存/增删改书签
+- 调用 BookmarkFilter 进行搜索
+- 做标签计数、分页、结果封装
+- 决定 visibility 默认值
+
+**核心事实行为**：
+
+| 方法 | 关键事实 |
+|-----|---------|
+| `__construct` | `isLoggedIn=false` 且 `hide_public_links=true` → 完全不加载数据 |
+| `search($request, $visibility, ...)` | visibility=null 时 → 登录用 `all`，未登录用 `public`；总是组合 `FILTER_TAG \| FILTER_TEXT`；用 `SearchResult` 分页 |
+| `bookmarksCountPerTag($filteringTags, $visibility)` | 先调用 `search()` 获取候选 → 遍历标签 → `strtolower` 合并 → 排除过滤标签本身 → `array_multisort` 排序 |
+| `findByHash($hash, $privateKey)` | 未登录+私有书签→校验 private_key，失败抛异常 |
+
+**search 与 filterTags 的协作事实**（[BookmarkFileService.php#L137-L171](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFileService.php#L137-L171)）：
+
+```
+BookmarkFileService::search(['searchtags' => '~.draft', 'searchterm' => ''], null)
     │
-    ▼ $this->search(['searchtags' => ['linux']], 'all')
-    │   → 过滤出含 linux 标签的书签
+    ├─ visibility 决策: 未登录 → 'public'
     │
-    ▼ 遍历书签的标签:
+    ├─ 调用 BookmarkFilter::filter(
+    │      FILTER_TAG | FILTER_TEXT,
+    │      ['~.draft', ''],        ← $request 原样传入
+    │      casesensitive=false,
+    │      visibility='public',
+    │      untaggedonly=false
+    │  )
     │
-    ├─ 过滤条件:
-    │   ├─ 空标签 → 跳过
-    │   ├─ 未登录 + . 开头 → 跳过
-    │   ├─ nomarkdown → 跳过
-    │   └─ 搜索过滤标签本身（即 linux) → 跳过
+    └─ BookmarkFilter::filter 路由
+        │
+        ├─ $type = "vuotext"  (FILTER_TAG|"tags" | FILTER_TEXT|"fulltext" = "vuotext")
+        │
+        ├─ 如果 searchtags 非空且 searchterm 非空
+        │   → filterTags 先缩小范围 → 结果传给新 Filter 实例 → filterFulltext
+        │
+        └─ 如果只有 searchtags='~.draft'（searchterm 空）
+            → filterTags('~.draft', false, 'public') ← 直接进入标签过滤
+              │
+              ├─ tags_str2array → ['~.draft']
+              ├─ array_filter(public隐藏标签过滤) → startsWith('~.draft','.')=false → **保留**
+              ├─ AND 部分: tag2regex('~.draft') → $tag[0]='~' → 返回 ''
+              ├─ OR 提取: substr('~.draft',1) → '.draft' ← ⚠️ 隐藏标签
+              ├─ 正则: /^(?=.*(?:^| )(\.draft)(?:$| )).*$/i
+              └─ preg_match 公开书签标签字符串 → ⚠️ 匹配到 .draft 隐藏标签的公开书签
+```
+
+**bookmarksCountPerTag 事实流程**（[BookmarkFileService.php#L324-L363](file:///d:/fz/0601-1/solo-dogfeeding/code/73-Shaarli/application/bookmark/BookmarkFileService.php#L324-L363)）：
+
+```
+输入: filteringTags=[], visibility=null (未登录→public)
     │
-    ├─ 大小写合并:
-    │   $key = strtolower($tag)
+    ▼ search() 过滤 → 仅公开书签
+    │
+    ▼ 遍历书签标签:
+    │
+    ├─ 4 个 continue 条件:
+    │   1. empty($tag)                    → 空标签跳过
+    │   2. !isLoggedIn && startsWith('.') → 未登录隐藏标签跳过 ✓ (只有这里过滤了.)
+    │   3. nomarkdown                     → 内部标签跳过
+    │   4. in_array($filteringTags, true) → 搜索过滤标签本身跳过
+    │
+    ├─ 大小写合并 (BUG):
+    │   $key = strtolower($tag)           ← 只改 A-Z，UTF-8 非 ASCII 不变
     │   if (!isset($caseMapping[$key])) {
-    │       $caseMapping[$key] = $tag;  // 首次遇到的写法
-    │       $tags[$caseMapping[$key]] = 0;
+    │       $caseMapping[$key] = $tag;    // 首次遇到的原始写法保留
+    │       $tags[$tag] = 0;
     │   }
-    │   $tags[$caseMapping[$key]]++;
+    │   $tags[$caseMapping[$key]]++;      // 计数
     │
-    ▼ 排序:
-        array_multisort($tags, SORT_DESC, $tmpTags, SORT_ASC)
-        → 按计数降序，同计数按字母升序
+    ▼ array_multisort 排序:
+        先按计数值 DESC，再按标签名 ASC
 ```
 
-#### 关键交互：
-
-| 场景 | 说明 |
-|-----|------|
-| 搜索过滤标签本身被排除 | 如果搜索 `linux`，标签云不会显示 `linux` 标签计数 |
-| 首次写法优先 | 先遇到 `Étude`，后遇到 `étude`，显示 `Étude` |
-| Unicode 大小写不合并 | 希腊语 `Σ` 和 `σ` 被当作不同标签 |
-| 隐藏标签过滤 | 未登录时 `.` 开头标签不显示 |
+注意：与 `filterTags` 不同，`bookmarksCountPerTag` 中的 `.` 前缀隐藏标签过滤是**直接检查标签本身**（`startsWith($tag, '.')`），不是检查搜索输入。所以在标签云中，未登录用户看不到 `.draft` 标签，但通过 `filterTags` 的 OR 路径漏洞能搜索到含有 `.draft` 标签的公开书签。这是两个地方的隐私保护强度不一致。
 
 ---
 
-### 11.6 代码缺陷汇总与修复建议
+### 11.6 代码缺陷汇总与修复建议（修正版）
 
-| 缺陷 | 位置 | 严重程度 | 修复建议 |
-|-----|------|---------|---------|
-| `~.hidden` 隐私旁路 | filterTags 第346-354行 | 🔴 高 | OR 标签 `substr` 后再次检查 `.` 前缀过滤 |
-| `strtolower` Unicode 大小写 | bookmarksCountPerTag 第341行 | 🟡 中 | 改用 `mb_convert_case($tag, MB_CASE_LOWER, 'UTF-8') |
-| `strpos` vs `mb_strpos` 不一致 | filterFulltext 第289行 | 🟢 低 | 统一使用 `mb_strpos` |
-| OR 路径不剥 `+`/`-` 前缀 | filterTags 第347行 | 🟡 中 | OR 提取后调用与 AND 一致的前缀剥离 |
-| 单 `-+bar` 语义反直觉 | tag2regex 第489-496行 | 🟡 中 | 明确文档或统一前缀剥离顺序 |
+| # | 缺陷 | 位置 | 严重程度 | 证据/影响 |
+|---|-----|------|---------|----------|
+| 1 | **`~.hidden` OR 路径隐私旁路** | filterTags L346-L354 | 🔴 高 | Node.js 实测确认：`~.draft` 正则匹配 `.draft` 标签，隐藏标签存在性泄露 |
+| 2 | **OR 路径不剥 `+`/`-` 前缀 (BUG)** | filterTags L347 + tag2matchterm 注释 L507 | 🟡 高 | ① 违反 tag2matchterm 前置条件注释；② `~-baz` 匹配目标 `-baz` 不可能存在（setTags 去前导 `-`）；③ 与 AND 路径不一致 |
+| 3 | **`strtolower` 非 ASCII 全不合并** | bookmarksCountPerTag L341 | 🟡 中 | 实测确认：法语/德语/希腊语/俄语等所有非英语语言大小写标签无法合并，标签云出现重复条目 |
+| 4 | **`strpos` vs `mb_strpos` 不一致** | filterFulltext L289 | 🟢 低 | UTF-8 自同步特性保证了安全，但风格不一致，建议统一 |
+| 5 | **`-+bar` 链式前缀剥离反直觉** | tag2regex L489-L496 | 🟢 低 | `-+` 顺序会保留 `+`，语义与 `+-` 不对称 |
 
-#### 隐私旁路修复代码示例：
+#### 缺陷 1 修复：~.hidden 隐私旁路（高优先级）
 
 ```php
-// 修复前:
+// [BookmarkFilter.php L346-L348] 修复前:
 $orTags = array_filter(array_map(function ($tag) {
     return startsWith($tag, '~') ? substr($tag, 1) : null;
 }, $inputTags));
@@ -1564,21 +1713,68 @@ $orTags = array_filter(array_map(function ($tag) use ($visibility) {
     if ($visibility === self::$PUBLIC && startsWith($orTag, '.')) {
         return null;
     }
-    return $orTag;
+    return $orTag === '' ? null : $orTag;
+}, $inputTags));
+
+// 如果 OR 标签被清空，需要防止空的 (?=.*(?:^| )()(?:$| )) 匹配一切
+if (!empty($orTags)) {
+    $re_or = implode('|', array_map([$this, 'tag2matchterm'], $orTags));
+    // ...
+}
+```
+
+#### 缺陷 2 修复：OR 路径不剥前缀（BUG）
+
+```php
+// 在上面修复基础上增加前缀剥离：
+$orTags = array_filter(array_map(function ($tag) use ($visibility) {
+    if (!startsWith($tag, '~')) return null;
+    $orTag = substr($tag, 1);
+    
+    // 复用 tag2regex 的前缀剥离逻辑
+    if (strlen($orTag) > 0 && $orTag[0] === '+' && isset($orTag[1])) {
+        $orTag = substr($orTag, 1);
+    }
+    // - 前缀在 OR 中语义无意义（无法表达"排除 OR 某标签"）
+    // 且 setTags 保存时已去前导 -，故也剥掉
+    if (strlen($orTag) > 0 && $orTag[0] === '-') {
+        $orTag = substr($orTag, 1);
+    }
+    
+    if ($visibility === self::$PUBLIC && startsWith($orTag, '.')) {
+        return null;
+    }
+    return $orTag === '' ? null : $orTag;
 }, $inputTags));
 ```
 
-#### Unicode 大小写修复：
+修复后行为：`~+foo` → 匹配 `foo` ✓，`~-baz` → 匹配 `baz` ✓
+
+#### 缺陷 3 修复：strtolower → mb_convert_case
 
 ```php
-// 修复前:
+// [BookmarkFileService.php L340-L345] 修复前:
 if (!isset($caseMapping[strtolower($tag)])) {
     $caseMapping[strtolower($tag)] = $tag;
+    $tags[$caseMapping[strtolower($tag)]] = 0;
 }
+$tags[$caseMapping[strtolower($tag)]]++;
 
 // 修复后:
 $lowerTag = mb_convert_case($tag, MB_CASE_LOWER, 'UTF-8');
 if (!isset($caseMapping[$lowerTag])) {
     $caseMapping[$lowerTag] = $tag;
+    $tags[$caseMapping[$lowerTag]] = 0;
 }
+$tags[$caseMapping[$lowerTag]]++;
+```
+
+#### 缺陷 4 修复：统一使用 mb_strpos
+
+```php
+// [BookmarkFilter.php L289] 修复前:
+$found = strpos($content, $excludeSearch[$i]) === false;
+
+// 修复后:
+$found = mb_strpos($content, $excludeSearch[$i]) === false;
 ```
