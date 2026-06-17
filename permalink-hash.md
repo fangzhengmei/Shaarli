@@ -1,22 +1,28 @@
 # Shaarli 短链（Permalink）Hash 生成、冲突避让与旧链回查全链路解析
 
+> 本文档中所有代码引用均使用**相对于项目根目录**的可迁移路径。
+> 例如 `application/Utils.php` 表示项目根目录下的 `application/Utils.php` 文件。
+
+---
+
 ## 0. 核心文件索引
 
-| 模块 | 文件 | 关键函数/方法 |
-|------|------|---------------|
-| Hash 算法 | [Utils.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/Utils.php) | `smallHash()` (L47-L51) |
-| Hash 组装 | [LinkUtils.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/LinkUtils.php) | `link_small_hash()` (L191-L194) |
-| Bookmark 模型 | [Bookmark.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/Bookmark.php) | `setId()` (L139-L150) |
-| ID 分配器 | [BookmarkArray.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/BookmarkArray.php) | `getNextId()` (L211-L217) |
-| 查重/查找 | [BookmarkFilter.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/BookmarkFilter.php) | `filterSmallHash()` (L178-L188) |
-| Service 入口 | [BookmarkFileService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/BookmarkFileService.php) | `findByHash()` (L110-L124), `add()` (L222-L239) |
-| 路由入口 | [index.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/index.php) | 路由注册 (L117-L118) |
-| Permalink 控制器 | [BookmarkListController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/front/controller/visitor/BookmarkListController.php) | `permalink()` (L129-L160), `processLegacyController()` (L210-L242) |
-| 旧版短链兼容 | [LegacyLinkDB.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/legacy/LegacyLinkDB.php) | `read()` 内 shorturl 兼容 (L320-L327) |
-| 数据迁移(旧→新) | [LegacyUpdater.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/legacy/LegacyUpdater.php) | `updateMethodDatastoreIds()` (L247-L280) |
-| Note URL 迁移 | [Updater.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/updater/Updater.php) | `updateMethodMigrateExistingNotesUrl()` (L151-L173) |
-| 旧路由跳转 | [LegacyController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/legacy/LegacyController.php) | 各旧路由 `?do=xxx` 方法 |
-| API 查重 | [Links.php](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/api/controllers/Links.php) | `postLink()` 内 URL 查重 (L126-L135) |
+| 模块 | 文件路径 | 关键函数/方法 |
+|------|---------|---------------|
+| Hash 算法 | `application/Utils.php` | `smallHash()` |
+| Hash 组装 | `application/bookmark/LinkUtils.php` | `link_small_hash()` |
+| Bookmark 模型 | `application/bookmark/Bookmark.php` | `setId()` |
+| ID 分配器 | `application/bookmark/BookmarkArray.php` | `getNextId()` |
+| 文件 IO 与锁 | `application/bookmark/BookmarkIO.php` | `read()`, `write()`, `synchronized()` |
+| 查重/查找 | `application/bookmark/BookmarkFilter.php` | `filterSmallHash()` |
+| Service 入口 | `application/bookmark/BookmarkFileService.php` | `findByHash()`, `add()`, `save()` |
+| 路由入口 | `index.php` | 路由注册 |
+| Permalink 控制器 | `application/front/controller/visitor/BookmarkListController.php` | `permalink()`, `processLegacyController()` |
+| 旧版短链兼容 | `application/legacy/LegacyLinkDB.php` | `read()` 内 shorturl 兼容 |
+| 数据迁移(旧→新) | `application/legacy/LegacyUpdater.php` | `updateMethodDatastoreIds()` |
+| Note URL 迁移 | `application/updater/Updater.php` | `updateMethodMigrateExistingNotesUrl()` |
+| 旧路由跳转 | `application/legacy/LegacyController.php` | 各旧路由 `?do=xxx` 方法 |
+| API 查重 | `application/api/controllers/Links.php` | `postLink()` 内 URL 查重 |
 
 ---
 
@@ -24,7 +30,7 @@
 
 ### 1.1 算法本体：`smallHash()`
 
-位置：[Utils.php#L47-L51](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/Utils.php#L47-L51)
+位置：`application/Utils.php` 第 47-51 行
 
 ```php
 function smallHash($text)
@@ -36,20 +42,20 @@ function smallHash($text)
 
 流水线拆解：
 
-1. `hash('crc32', $text, true)` — 用 CRC32 生成 4 字节二进制摘要（非密码学安全，只是为了短+唯一）
-2. `base64_encode(...)` — 4 字节 → 约 6 字符 Base64
-3. `rtrim(..., '=')` — 去掉 Base64 的填充符 `=`
-4. `strtr($t, '+/', '-_')` — 把 Base64 的 `+` 换成 `-`，`/` 换成 `_`，得到 **RFC 4648 base64url** 格式，确保 URL 安全
+1. `hash('crc32', $text, true)` — CRC32 生成 4 字节二进制摘要（非密码学安全）
+2. `base64_encode(...)` — 4 字节 → 6 字符 Base64
+3. `rtrim(..., '=')` — 去掉 Base64 填充符 `=`
+4. `strtr($t, '+/', '-_')` — 转成 RFC 4648 base64url 格式，确保 URL 安全
 
-**输出特性**：固定 6 字符，字符集 `[a-zA-Z0-9-_@]`，非加密安全哈希。
+**输出特性**：固定 6 字符，字符集 `[a-zA-Z0-9-_]`，输出空间大小约 64⁶ ≈ 687 亿种可能。
 
 ### 1.2 输入盐组装：新旧两版
 
-Shaarli 经历了两次 hash 输入盐的演变，这是冲突避让的核心：
+Shaarli 经历了两次 hash 输入盐的演变，这是理解冲突策略的关键。
 
 #### 新版（v0.8.1+）—— `日期 + ID`
 
-位置：[LinkUtils.php#L191-L194](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/LinkUtils.php#L191-L194)
+位置：`application/bookmark/LinkUtils.php` 第 191-194 行
 
 ```php
 function link_small_hash($date, $id)
@@ -59,10 +65,10 @@ function link_small_hash($date, $id)
 ```
 
 - `Bookmark::LINK_DATE_FORMAT = 'Ymd_His'`，例如 `20111006_131924`
-- ID 是自增整数，和日期拼接后作为 smallHash 的输入
+- ID 是自增整数，和日期字符串拼接后作为 smallHash 输入
 - 例：`smallHash('20111006_131924' . 142)` → `eaWxtQ`
 
-触发点在 [Bookmark.php#L139-L150](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/Bookmark.php#L139-L150) 的 `setId()` 中：
+触发点在 `application/bookmark/Bookmark.php` 第 139-150 行的 `setId()` 中：
 
 ```php
 public function setId(?int $id): Bookmark
@@ -78,7 +84,7 @@ public function setId(?int $id): Bookmark
 }
 ```
 
-> 注意 guard `if (empty($this->shortUrl))`：如果 Bookmark 已经设置了 shortUrl（例如从旧数据加载），就不会覆盖，这是**保留旧 hash 的关键**。
+> 关键 guard `if (empty($this->shortUrl))`：如果 Bookmark 已经设置了 shortUrl（例如从旧数据加载），就不会覆盖。这是**保留旧 hash 的关键**。
 
 #### 旧版（v0.8.1 之前）—— 仅用日期
 
@@ -87,30 +93,32 @@ public function setId(?int $id): Bookmark
 > @warning before v0.8.1, smallhashes were built only with the date,
 >          and their value has been preserved.
 
-即旧版输入只有 `date`，如 `smallHash('20111006_131924')`。这在同一秒创建多条链接时**必然冲突**，催生了改版。
+旧版输入只有 `date`，如 `smallHash('20111006_131924')`。这在同一秒创建多条链接时**必然冲突**——这也是改版的直接原因。
 
-旧数据加载时的兼容在 [LegacyLinkDB.php#L320-L327](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/legacy/LegacyLinkDB.php#L320-L327)：
+旧数据加载时的兼容逻辑在 `application/legacy/LegacyLinkDB.php` 第 320-327 行：
 
 ```php
 if (!isset($link['created'])) {
     $link['id'] = $link['linkdate'];
     $link['created'] = DateTime::createFromFormat(self::LINK_DATE_FORMAT, $link['linkdate']);
     // ...
-    $link['shorturl'] = smallHash($link['linkdate']);  // 仅日期，与旧版一致
+    $link['shorturl'] = smallHash($link['linkdate']);  // 旧算法，仅日期
 }
 ```
 
-这段代码的意义：**从仍以 `linkdate` 为主键的老 datastore 加载时，用旧算法生成 shorturl 并暂存，保证升级后外链不失效。**
+> 这段代码的意义：从仍以 `linkdate` 为主键的老 datastore 加载时，用旧算法生成 shorturl 并暂存，保证升级后外链不失效。
 
 ---
 
-## 2. 冲突避让：从"事后查重"转向"事前唯一性设计"
+## 2. 三个核心概念的边界与联系
 
-Shaarli 并没有做传统意义上的"生成后查数据库看是否重复 + 重试"。它的策略是**让输入源本身就是全局唯一的**，从而在数学上消除冲突可能。
+这是理解整个设计最容易混淆的部分。先把三个概念拆开，再看它们如何相互作用。
 
-### 2.1 唯一性来源：自增整数 ID
+### 2.1 概念一：自增编号的唯一性
 
-位置：[BookmarkArray.php#L211-L217](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/BookmarkArray.php#L211-L217)
+**自增编号（ID）** 是 Bookmark 的主键，由 `BookmarkArray::getNextId()` 分配：
+
+位置：`application/bookmark/BookmarkArray.php` 第 211-217 行
 
 ```php
 public function getNextId(): int
@@ -122,63 +130,181 @@ public function getNextId(): int
 }
 ```
 
-`$this->ids` 是 ID → array offset 的映射表，`array_keys($this->ids)` 取出所有已有 ID，`max()+1` 就是下一个。ID 全局单调递增。
+`$this->ids` 是 `id → array offset` 的映射表，`max()+1` 取下一个。
 
-### 2.2 生成链路闭环
+**ID 唯一性的边界条件**：
 
-位置：[BookmarkFileService.php#L222-L239](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/BookmarkFileService.php#L222-L239)
+| 场景 | 是否唯一 | 原因 |
+|------|---------|------|
+| 单 PHP 进程、单请求内 | ✅ 绝对唯一 | 内存中计算，不会有竞争 |
+| 并发多请求同时 add | ❌ 不保证唯一 | 每个请求有独立内存副本，可能读到相同的 max(id) |
+| 绕过 Service 直接改 datastore | ❌ 不保证唯一 | 无任何约束检查 |
+
+**关于锁的粒度**：项目使用 `malkusch/lock` 库的 Mutex，但锁只包裹了**文件 IO 操作**本身（见 `application/bookmark/BookmarkIO.php` 的 `synchronized()` 方法），不包裹"读文件 → 计算 ID → 写文件"整个事务。也就是说：
+
+```
+请求 A:  [加锁]读文件[解锁] → 计算nextId=100 → 内存修改 → [加锁]写文件[解锁]
+请求 B:           [加锁]读文件[解锁] → 计算nextId=100 → 内存修改 → [加锁]写文件[解锁]
+```
+
+两个请求可能都读到同一个初始状态，分配到相同的 ID，后写的覆盖先写的。**这是并发场景下的真实风险。**
+
+> 但对 Shaarli 的目标场景（个人书签、低并发）而言，这个风险在实际使用中几乎不会触发。
+
+---
+
+### 2.2 概念二：短 Hash 摘要的碰撞
+
+**CRC32 摘要碰撞**是一个数学问题：不同的输入可能产生相同的 32 位输出。
+
+| 属性 | 值 |
+|------|----|
+| 输出长度 | 32 位（4 字节） |
+| 编码后长度 | 6 字符（base64url） |
+| 理论输出空间 | 2³² ≈ 42.9 亿种 |
+| 实际有效输出 | 因 base64 编码和去填充，接近 42.9 亿 |
+
+**生日悖论下的碰撞概率**（n 条记录中至少发生一次碰撞的概率 ≈ 1 - e^(-n²/(2·2³²))）：
+
+| 书签数量 | 碰撞概率 |
+|---------|---------|
+| 1,000 | ~ 0.00001% |
+| 10,000 | ~ 0.001% |
+| 77,000 | ~ 50% |
+| 100,000 | ~ 68% |
+| 1,000,000 | ~ 100%（几乎必然） |
+
+**关键结论**：对个人使用场景（几千到几万条书签），CRC32 碰撞的概率极低，可以忽略；但如果是大规模部署，这是一个真实风险。
+
+---
+
+### 2.3 概念三：短链冲突规避
+
+"短链冲突规避"是**系统设计层面**的策略，回答的问题是：如何确保每条 bookmark 的 shorturl 都是唯一的？
+
+Shaarli 的策略是**"输入唯一性保证"**，而不是"输出查重+重试"。具体来说：
+
+```
+输入: 日期字符串 + 自增ID
+         ↓
+     CRC32 哈希
+         ↓
+输出: 6 字符 shorturl
+```
+
+它的逻辑链条是：
+1. 因为 ID 是唯一的（在单进程假设下）
+2. 所以 "日期 + ID" 的组合也是唯一的
+3. 所以……"输出应该也不会重复吧"
+
+⚠️ **这里有一个逻辑跳跃**：输入唯一 ≠ 输出唯一。哈希函数不是单射。但 Shaarli 的代码中**完全没有 shorturl 去重检查**：
+
+- `BookmarkFileService::add()` 中不检查 shorturl 是否已存在
+- `BookmarkFileService::set()` 中也不检查
+- `BookmarkArray::offsetSet()` 只维护了 `$ids` 和 `$urls` 两个索引，**没有 `$shorturls` 索引**
+- 迁移时也不做去重
+
+**如果真的发生碰撞会怎样？**
+
+位置：`application/bookmark/BookmarkFilter.php` 第 178-188 行
+
+```php
+private function filterSmallHash(string $smallHash)
+{
+    foreach ($this->bookmarks as $key => $l) {
+        if ($smallHash == $l->getShortUrl()) {
+            // Yes, this is ugly and slow
+            return [$key => $l];  // 找到第一个就返回了！
+        }
+    }
+    throw new BookmarkNotFoundException();
+}
+```
+
+**后果**：如果两条 bookmark 的 shorturl 相同，只有排在前面的那条能通过 permalink 访问到，后面的那条"消失"了——既没有报错，也没有任何提示。
+
+---
+
+### 2.4 三者关系总览
+
+```
+  自增ID唯一性        CRC32哈希碰撞          短链冲突规避
+  (输入侧保证)        (数学性质)              (系统目标)
+       │                    │                        │
+       │  "ID 唯一           │  "不同输入             │  "确保每条
+       │   → 输入唯一"       │   可能同输出"          │   bookmark 的
+       │                    │                        │   shorturl 唯一"
+       └──────────┬─────────┘                        │
+                  │                                  │
+                  ▼                                  │
+          设计假设：输入唯一                         │
+                  │                                  │
+                  └──────────────→ 输出应该唯一 ←────┘
+                                       ↑
+                                       │
+                               隐含假设：CRC32 不会碰撞
+                               （个人场景下近似成立）
+```
+
+**风险界限总结**：
+
+| 风险类型 | 触发条件 | 后果 | 严重程度（个人场景） |
+|---------|---------|------|---------------------|
+| 并发写入导致 ID 重复 | 两个请求同时 add | 数据丢失、shorturl 冲突 | 极低（几乎单人使用） |
+| CRC32 自然碰撞 | 书签量 > 7 万条 | 部分 bookmark 无法通过 permalink 访问 | 低（个人用不到那么多） |
+| 人为构造碰撞 | 攻击者故意构造 CRC32 碰撞的 URL | 书签被"覆盖"，无法通过短链访问 | 中（但 Shaarli 是自用工具） |
+| 外部修改 datastore | 手工/脚本直接编辑 datastore 文件 | ID 或 shorturl 重复 | 低（不推荐这么做） |
+
+---
+
+## 3. 生成链代码走读
+
+完整的添加书签流程：
+
+位置：`application/bookmark/BookmarkFileService.php` 第 222-239 行
 
 ```php
 public function add(Bookmark $bookmark, bool $save = true): Bookmark
 {
-    // ...
-    $bookmark->setId($this->bookmarks->getNextId());  // 1. 先拿到唯一 ID
-    $bookmark->validate();                            // 2. 校验（含 shortUrl 非空）
+    // 权限检查...
+    if (!empty($bookmark->getId())) {
+        throw new Exception(t('This bookmarks already exists'));
+    }
+    
+    $bookmark->setId($this->bookmarks->getNextId());  // 1. 分配 ID → 顺带生成 shortUrl
+    $bookmark->validate();                            // 2. 校验
 
-    $this->bookmarks[$bookmark->getId()] = $bookmark; // 3. 写入
-    // ...
+    $this->bookmarks[$bookmark->getId()] = $bookmark; // 3. 写入内存
+    
+    if ($save === true) {
+        $this->save();                                // 4. 写回磁盘
+        $this->history->addLink($bookmark);
+    }
+    return $this->bookmarks[$bookmark->getId()];
 }
 ```
 
-而 `setId()` 内部会调用 `link_small_hash(created, id)`，因为 `created+id` 的组合**全局唯一**（id 唯一），所以输出的 CRC32 即使理论上可能碰撞，但输入源本身绝不重复——**这是一种设计层面的冲突避让，而非运行时查重**。
-
-> 设计洞察：把 shortUrl 的"输入唯一性问题"降维为"自增 ID 唯一性问题"，而后者只需要一把互斥锁（项目用了 `malkusch/lock` 的 Mutex，见 BookmarkFileService 的构造函数）就可以保证。
-
-### 2.3 URL 维度的查重（不是 hash 查重）
-
-REST API 创建链接时有一层 URL 查重（409 Conflict），这是业务层面的"重复书签不重复存"，不是 shorturl hash 查重。
-
-位置：[Links.php#L126-L135](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/api/controllers/Links.php#L126-L135)
-
-```php
-if (
-    ! empty($bookmark->getUrl())
-    && ! empty($dup = $this->bookmarkService->findByUrl($bookmark->getUrl()))
-) {
-    return $response->withJson(ApiUtils::formatLink($dup, ...), 409, ...);
-}
-```
-
-`findByUrl()` 走的是 [BookmarkArray.php#L224-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/BookmarkArray.php#L224-L234) 中维护的 `$urls` 哈希表（key=url, value=offset），O(1) 命中。
+**关键点**：
+- 第 230 行 `setId()` 是 shortUrl 的生成时机——设置 ID 的时候"顺便"把 shortUrl 也算出来了
+- `validate()` 只校验字段非空等基础约束，**不校验 shorturl 唯一性**
+- 整个 `add()` 方法不在锁内，只有 `save()` 内部的文件写入在锁内
 
 ---
 
-## 3. 查重/查找：从 URL 到 Bookmark 的路径
+## 4. 回查链代码走读
 
-### 3.1 Permalink 页面路由
+### 4.1 路由
 
-路由注册在 [index.php#L117-L118](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/index.php#L117-L118)：
+路由注册在 `index.php` 第 117-118 行：
 
 ```php
 $this->get('/', '\Shaarli\Front\Controller\Visitor\BookmarkListController:index');
 $this->get('/shaare/{hash}', '\Shaarli\Front\Controller\Visitor\BookmarkListController:permalink');
 ```
 
-所以 Permalink 的形式是 `https://host/shaare/{6位hash}`。
+### 4.2 控制器 → Service → Filter
 
-### 3.2 控制器入口 → 查找
-
-位置：[BookmarkListController.php#L129-L160](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/front/controller/visitor/BookmarkListController.php#L129-L160)
+位置：`application/front/controller/visitor/BookmarkListController.php` 第 129-160 行
 
 ```php
 public function permalink(Request $request, Response $response, array $args): Response
@@ -194,54 +320,42 @@ public function permalink(Request $request, Response $response, array $args): Re
 }
 ```
 
-注意 `?key=` 参数：私有链接（`isPrivate()` 为 true）在游客未登录时，需要附带该链接的一次性分享 key 才能访问。key 存储在 `additional_content['private_key']` 里（见 [BookmarkFileService.php#L110-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/BookmarkFileService.php#L110-L124)）。
+`?key=` 参数用于私有链接的游客访问：未登录用户需要附带该链接的分享 key 才能查看私有书签。key 存在 `additional_content['private_key']` 中。
 
-### 3.3 findByHash → filterSmallHash：线性扫描
-
-位置：[BookmarkFileService.php#L110-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/BookmarkFileService.php#L110-L124)
+位置：`application/bookmark/BookmarkFileService.php` 第 110-124 行
 
 ```php
 public function findByHash(string $hash, string $privateKey = null): Bookmark
 {
     $bookmark = $this->bookmarkFilter->filter(BookmarkFilter::$FILTER_HASH, $hash);
     $first = reset($bookmark);
-    if (
-        !$this->isLoggedIn
-        && $first->isPrivate()
-        && (empty($privateKey) || $privateKey !== $first->getAdditionalContentEntry('private_key'))
-    ) {
-        throw new BookmarkNotFoundException();
-    }
+    // 私有链接权限校验...
     return $first;
 }
 ```
 
-真正的查找实现在 [BookmarkFilter.php#L178-L188](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/BookmarkFilter.php#L178-L188)：
+最终落到 `BookmarkFilter::filterSmallHash()` 的 O(n) 线性扫描——遍历全部 bookmarks，逐一比较 `getShortUrl()`。
 
-```php
-private function filterSmallHash(string $smallHash)
-{
-    foreach ($this->bookmarks as $key => $l) {
-        if ($smallHash == $l->getShortUrl()) {
-            // Yes, this is ugly and slow
-            return [$key => $l];
-        }
-    }
-    throw new BookmarkNotFoundException();
-}
-```
+### 4.3 URL 维度的查重（不是 hash 查重）
 
-作者自己都标注了 `ugly and slow` —— 当前是**O(n) 线性扫描**全部 bookmarks，逐个比较 `getShortUrl()`。Shaarli 是纯文件存储、面向"个人几百几千条书签"的体量设计，所以这种实现是可接受的。若要优化，可以在 BookmarkArray 中追加一个 `shortUrl => offset` 的映射表。
+注意区分两种不同的"查重"：
+
+| 查重类型 | 用途 | 实现 | 时间复杂度 |
+|---------|------|------|-----------|
+| URL 查重 | 防止重复添加相同 URL 的书签 | `BookmarkArray` 的 `$urls` 哈希表 | O(1) |
+| shorturl 查重 | 防止 permalink 冲突 | **没有做** | — |
+
+REST API 创建时会做 URL 查重（返回 409 Conflict），见 `application/api/controllers/Links.php` 第 126-135 行。
 
 ---
 
-## 4. 旧链兼容与回查策略（三层保护）
+## 5. 旧链兼容与回查策略（三层保护）
 
-### 4.1 第一层：Query String 小 Hash 重定向
+### 5.1 第一层：Query String → 新路由的 HTTP 重定向
 
-老版本 Shaarli 的 permalink 是挂在根 URL 上的，例如 `https://host/?abcdef`（6 位 hash 直接当 query string）。新版本改走 `/shaare/abcdef` 路由，所以在首页控制器里做了一次兼容检测。
+老版本 permalink 格式是 `https://host/?abcdef`（hash 直接当 query string）。新版本是 `/shaare/abcdef`。
 
-位置：[BookmarkListController.php#L210-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/front/controller/visitor/BookmarkListController.php#L210-L242)
+位置：`application/front/controller/visitor/BookmarkListController.php` 第 210-242 行
 
 ```php
 protected function processLegacyController(Request $request, Response $response): ?Response
@@ -251,77 +365,56 @@ protected function processLegacyController(Request $request, Response $response)
     if (null !== $queryString && 1 === preg_match('/^([a-zA-Z0-9-_@]{6})($|&|#)/', $queryString, $match)) {
         return $this->redirect($response, '/shaare/' . $match[1]);
     }
-
-    // Legacy controllers (mostly used for redirections)  -- ?do=xxx 等
     // ...
 }
 ```
 
-正则 `/^([a-zA-Z0-9-_@]{6})($|&|#)/` 匹配：
-- 开头正好 6 个合法 hash 字符
-- 后面要么结束（`$`），要么接 `&`（其他参数），要么接 `#`（锚点）
+正则 `/^([a-zA-Z0-9-_@]{6})($|&|#)/` 匹配正好 6 个合法 hash 字符的 query string，命中后 302 重定向到新路由。
 
-命中后做 HTTP 重定向到新路由 `/shaare/{hash}`。**这是第一层旧链兼容：把旧 URL 结构的访问引导到新结构。**
+### 5.2 第二层：数据迁移时保留旧 shorturl 值
 
-### 4.2 第二层：数据迁移时保留旧 shorturl 值
+迁移过程分三步，**全程不重算 shorturl**：
 
-数据从老版本升级时，有两个连续的 update 方法确保旧 hash 不丢失：
+#### 步骤 A：LegacyLinkDB 读取时临时生成 shorturl（旧算法）
 
-#### 步骤 A：LegacyLinkDB 读取时临时生成 shorturl（仅日期旧算法）
+对还没迁移的、主键仍是 `linkdate` 的老数据，先用旧算法 `smallHash(linkdate)` 生成 shorturl 暂存在内存里。见 `application/legacy/LegacyLinkDB.php` 第 320-327 行。
 
-见 [LegacyLinkDB.php#L320-L327](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/legacy/LegacyLinkDB.php#L320-L327)，对还没迁移的、主键仍是 `linkdate` 的老数据：
+#### 步骤 B：updateMethodDatastoreIds —— 换主键，不动 shorturl
 
-```php
-$link['shorturl'] = smallHash($link['linkdate']);  // 旧算法，仅日期
-```
-
-生成后暂存在内存里的 link 数组里。
-
-#### 步骤 B：updateMethodDatastoreIds —— 从日期主键迁移到整数 ID，**不重算 shorturl**
-
-位置：[LegacyUpdater.php#L247-L280](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/legacy/LegacyUpdater.php#L247-L280)
+位置：`application/legacy/LegacyUpdater.php` 第 247-280 行
 
 ```php
-public function updateMethodDatastoreIds()
-{
-    // ...判断数据库是否已是整数 ID 为主键...
+// 先备份
+$save = $this->conf->get('resource.data_dir') . '/datastore.' . date('YmdHis') . '.php';
+copy($this->conf->get('resource.datastore'), $save);
 
-    $links = [];
-    foreach ($this->linkDB as $offset => $value) {
-        $links[] = $value;        // value['shorturl'] 是步骤 A 生成的旧值
-        unset($this->linkDB[$offset]);
-    }
-    $links = array_reverse($links);
-    $cpt = 0;
-    foreach ($links as $l) {
-        unset($l['linkdate']);   // 去掉旧主键
-        $l['id'] = $cpt;         // 分配新的整数 ID（0,1,2...）
-        $this->linkDB[$cpt++] = $l;  // ★ 注意： $l['shorturl'] 没有变化！
-    }
-    // 保存 + 重排序
+// 全部取出 → 反转 → 重新分配整数 ID
+$links = [];
+foreach ($this->linkDB as $offset => $value) {
+    $links[] = $value;
+}
+$links = array_reverse($links);
+$cpt = 0;
+foreach ($links as $l) {
+    unset($l['linkdate']);   // 去掉旧主键
+    $l['id'] = $cpt;         // 分配新的整数 ID
+    $this->linkDB[$cpt++] = $l;  // shorturl 原样保留！
 }
 ```
 
-关键点：整个迁移过程只替换主键字段，**不动 `shorturl`**，因此：
-- 老用户用 `?abcdef` 访问 → 经第 4.1 节的重定向到 `/shaare/abcdef` → 查表找到 `shorturl=abcdef` 的那条 bookmark → 正确命中
+整个过程只替换主键字段，**不动 `shorturl`**。迁移后新 ID 是 0, 1, 2... 的顺序编号。
 
-#### 步骤 C：updateMethodMigrateDatabase —— 数组 → Bookmark 对象
+#### 步骤 C：updateMethodMigrateDatabase —— 数组转 Bookmark 对象
 
-位置：[LegacyUpdater.php#L581-L596](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/legacy/LegacyUpdater.php#L581-L596)
+位置：`application/legacy/LegacyUpdater.php` 第 581-596 行
 
-```php
-foreach ($this->linkDB as $key => $link) {
-    $linksArray[$key] = (new Bookmark())->fromArray($link, ...);
-}
-```
+`Bookmark::fromArray()` 直接把 `$data['shorturl']` 赋值给 `$this->shortUrl`，不会触发 `setId()` 中的 shortUrl 重算逻辑。旧值原样保留。
 
-`Bookmark::fromArray()` 直接把 `$data['shorturl']` 赋值给 `$this->shortUrl`（见 [Bookmark.php#L69-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/bookmark/Bookmark.php#L69-L91)），不会触发 `setId()` 中的 shortUrl 重算逻辑。旧值原样保留。
+### 5.3 第三层：Note URL 的 `?` → `/shaare/` 规范化
 
-### 4.3 第三层：Note URL 的 `?` → `/shaare/` 迁移
+旧版本中"笔记"类型（无外部 URL，纯站内文本）的 url 字段是 `?abcdef` 形式。新路由改为 `/shaare/abcdef` 后，需要把已存在的旧 url 也改过来。
 
-旧版本中，"笔记"类型（无外部 URL，纯站内文本）的 url 字段被写成 `?abcdef` 形式，即和 permalink 的 query string 一致。新路由改为 `/shaare/abcdef` 后，需要把已存在的这些旧 url 也改过来。
-
-位置：[Updater.php#L151-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/18-Shaarli/application/updater/Updater.php#L151-L173)
+位置：`application/updater/Updater.php` 第 151-173 行
 
 ```php
 public function updateMethodMigrateExistingNotesUrl(): bool
@@ -332,19 +425,13 @@ public function updateMethodMigrateExistingNotesUrl(): bool
             && startsWith($bookmark->getUrl(), '?')
             && 1 === preg_match('/^\?([a-zA-Z0-9-_@]{6})($|&|#)/', $bookmark->getUrl(), $match)
         ) {
-            $updated = true;
             $bookmark = $bookmark->setUrl('/shaare/' . $match[1]);
             $this->bookmarkService->set($bookmark, false);
         }
     }
-    if ($updated) {
-        $this->bookmarkService->save();
-    }
-    return true;
+    // save...
 }
 ```
-
-正则 `^\?([a-zA-Z0-9-_@]{6})($|&|#)` 把旧 url `?PCRizQ` 提取出 `PCRizQ`，重写为 `/shaare/PCRizQ`。
 
 > 三层兼容汇总：
 > 1. **HTTP 层**：`?{hash}` → 302 → `/shaare/{hash}`
@@ -353,101 +440,105 @@ public function updateMethodMigrateExistingNotesUrl(): bool
 
 ---
 
-## 5. 三段处理链路总览图
+## 6. 三段处理链路总览图
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                        一、生成链（创建 Bookmark）                     │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│   BookmarkFileService::add()                                          │
-│        │                                                              │
-│        ▼                                                              │
-│   BookmarkArray::getNextId()    ← 取 max(ID)+1，保证 ID 全局唯一      │
-│        │                                                              │
-│        ▼                                                              │
-│   Bookmark::setId(id)                                                 │
-│     ├─ 若 created 为空 → new DateTime()                               │
-│     └─ 若 shortUrl 为空 → link_small_hash(created, id)                │
-│                                │                                      │
-│                                ▼                                      │
-│                         smallHash(date_str + id)                      │
-│                           ├─ crc32 (raw binary)                       │
-│                           ├─ base64_encode                            │
-│                           ├─ rtrim '='                                │
-│                           └─ strtr '+/ → -_'  (base64url)            │
-│                                │                                      │
-│                                ▼                                      │
-│                   产出 6 字符 shortUrl 写入 Bookmark                  │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                        一、生成链（创建 Bookmark）                      │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│   BookmarkFileService::add()                                           │
+│        │                                                               │
+│        ▼                                                               │
+│   BookmarkArray::getNextId()    ← 取 max(ID)+1                        │
+│        │                ↑                                              │
+│        │                └── 单进程内唯一，并发下有风险                  │
+│        ▼                                                               │
+│   Bookmark::setId(id)                                                  │
+│     ├─ 若 created 为空 → new DateTime()                                │
+│     └─ 若 shortUrl 为空 → link_small_hash(created, id)                 │
+│                                │                                       │
+│                                ▼                                       │
+│                         smallHash(date_str + id)                       │
+│                           ├─ crc32 (raw binary)                        │
+│                           ├─ base64_encode                             │
+│                           ├─ rtrim '='                                 │
+│                           └─ strtr '+/ → -_'  (base64url)             │
+│                                │                                       │
+│                                ▼                                       │
+│                   产出 6 字符 shortUrl 写入 Bookmark                   │
+│                                                                        │
+│   ⚠️ 整个过程无 shorturl 查重，依赖"输入唯一→输出唯一"的隐含假设        │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
 
-┌───────────────────────────────────────────────────────────────────────┐
-│                        二、查重链（按 shortUrl 查找）                  │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│   GET /shaare/{hash}                                                  │
-│        │                                                              │
-│        ▼                                                              │
-│   BookmarkListController::permalink()                                 │
-│        │                                                              │
-│        ▼                                                              │
-│   BookmarkFileService::findByHash(hash, privateKey?)                  │
-│        │                                                              │
-│        ▼                                                              │
-│   BookmarkFilter::filter(FILTER_HASH, hash)                           │
-│        │                                                              │
-│        ▼                                                              │
-│   filterSmallHash()  → O(n) 线性遍历 bookmarks，比较 getShortUrl()    │
-│        │                                                              │
-│        ├─ 找到 + 公开 → 返回                                          │
-│        ├─ 找到 + 私有 + 登录 → 返回                                   │
-│        ├─ 找到 + 私有 + 游客 + ?key= 匹配 → 返回                      │
-│        └─ 未找到 → throw BookmarkNotFoundException → 404 页面        │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                        二、回查链（按 shortUrl 查找）                   │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│   GET /shaare/{hash}                                                   │
+│        │                                                               │
+│        ▼                                                               │
+│   BookmarkListController::permalink()                                  │
+│        │                                                               │
+│        ├─ 取 ?key= 参数（私有链接分享密钥）                             │
+│        ▼                                                               │
+│   BookmarkFileService::findByHash(hash, privateKey?)                   │
+│        │                                                               │
+│        ├─ 校验：私有 + 游客 + key不匹配 → 抛 NotFound                   │
+│        ▼                                                               │
+│   BookmarkFilter::filter(FILTER_HASH, hash)                            │
+│        │                                                               │
+│        ▼                                                               │
+│   filterSmallHash()  → O(n) 线性遍历，找到第一个就返回                  │
+│        │                                                               │
+│        ├─ 找到 → 返回 Bookmark                                         │
+│        └─ 未找到 → throw BookmarkNotFoundException → 404              │
+│                                                                        │
+│   ⚠️ 如果有多条相同 shortUrl，只有第一条能被访问到                      │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
 
-┌───────────────────────────────────────────────────────────────────────┐
-│                     三、外链跳转链（旧链兼容回查）                      │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│   用户访问  ?abcdef   (v0.8 之前的旧格式)                              │
-│        │                                                              │
-│        ▼                                                              │
-│   GET / → BookmarkListController::index()                             │
-│        │                                                              │
-│        ▼                                                              │
-│   processLegacyController()                                           │
-│     ├─ 正则匹配 QUERY_STRING 是否为 6 位合法 hash                     │
-│     └─ 命中 → redirect('/shaare/abcdef')   (第 1 层兼容)              │
-│        │                                                              │
-│        ▼                                                              │
-│   回到"查重链"                                                         │
-│        │                                                              │
-│        ▼                                                              │
-│   查表时，老 bookmark 的 shorturl 字段                                 │
-│     = 迁移时 smallHash(仅日期) 的旧值      (第 2 层兼容)              │
-│        │                                                              │
-│        └─ filterSmallHash 线性比较 → 命中正确条目 ✅                   │
-│                                                                       │
-│   ─────────────────────────────────────                               │
-│   附加：数据迁移管线（Updater 系列）                                   │
-│   1. LegacyLinkDB::read()       → 用旧算法 smallHash(linkdate) 做临时 │
-│   2. updateMethodDatastoreIds() → 替换主键为 ID，不动 shorturl        │
-│   3. updateMethodMigrateDatabase() → 数组转 Bookmark，仍不动 shorturl│
-│   4. updateMethodMigrateExistingNotesUrl() → ?xxx → /shaare/xxx      │
-│                                                 (第 3 层兼容)         │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                     三、旧链跳转链（兼容回查）                           │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│   用户访问  ?abcdef   (v0.8 之前的旧格式)                               │
+│        │                                                               │
+│        ▼                                                               │
+│   GET / → index() → processLegacyController()                          │
+│        │                                                               │
+│        ├─ 正则匹配 QUERY_STRING                                        │
+│        └─ 命中 → redirect('/shaare/abcdef')   (第 1 层)                │
+│        │                                                               │
+│        ▼                                                               │
+│   回到"回查链"                                                          │
+│        │                                                               │
+│        ▼                                                               │
+│   查表时，老 bookmark 的 shorturl = 迁移时保留的旧值  (第 2 层)         │
+│        │                                                               │
+│        └─ filterSmallHash 线性比较 → 命中 ✅                            │
+│                                                                        │
+│   ─────────────────────────────────────                                │
+│   数据迁移管线（Updater 系列）                                          │
+│   1. LegacyLinkDB::read()        → 旧算法 smallHash(linkdate) 临时生成  │
+│   2. updateMethodDatastoreIds()  → 换主键为 ID，不动 shorturl           │
+│   3. updateMethodMigrateDatabase() → 数组转 Bookmark，仍不动 shorturl  │
+│   4. updateMethodMigrateExistingNotesUrl() → ?xxx → /shaare/xxx        │
+│                                                  (第 3 层)              │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 6. 设计权衡总结
+## 7. 设计权衡表
 
-| 维度 | 选择 | 代价 |
-|------|------|------|
-| 冲突避让 | 不做"生成后查重"，而是用"自增 ID + 日期"保证输入唯一 | 依赖文件锁保证 ID 分配原子性；若外部绕过 service 直接改 datastore 可能破功 |
-| Hash 算法 | CRC32 + base64url | 非加密安全，可被伪造，不能用于任何安全授权 |
-| 查找效率 | O(n) 线性扫描 `filterSmallHash` | 代码简单但对超大量 bookmark 有性能压力；可追加 `shortUrl => offset` 映射表优化 |
-| 旧链兼容 | 三层防护：HTTP 重定向 + 迁移时保留 shorturl 原值 + Note URL 字段修正 | 迁移步骤多，但链路完整，老用户的分享链接不会失效 |
+| 维度 | 选择 | 收益 | 代价/风险 |
+|------|------|------|-----------|
+| 冲突避让策略 | 输入唯一性保证（ID 唯一 → shortUrl 应该唯一） | 代码极简，零运行时开销 | 依赖隐含假设，无硬保障；CRC32 理论碰撞；并发下 ID 可能重复 |
+| Hash 算法 | CRC32 + base64url | 极快、输出短（6 字符）、URL 安全 | 非加密安全，可被伪造，输出空间有限 |
+| 查找实现 | O(n) 线性扫描 `filterSmallHash` | 代码简单，无需维护额外索引 | 量大时性能差；作者自评 "ugly and slow" |
+| 并发控制 | Mutex 只保护文件 IO | 防止文件写损坏 | 不保护"读-算-写"事务，并发 add 可能丢数据 |
+| 旧链兼容 | 三层防护（HTTP 重定向 + 保留旧值 + Note URL 修正） | 旧分享链接全部不失效 | 迁移步骤多，新旧两种 hash 长期共存 |
+| 索引设计 | 只维护 id→offset 和 url→offset 两个索引 | 写入快、内存占用少 | shorturl 查找只能线性扫描 |
