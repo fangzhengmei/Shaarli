@@ -553,12 +553,368 @@ T5: 请求 Z 修改 #3 → "C2" → save() → 磁盘={#1:"A", #2:"B", #3:"C2"} 
 
 Shaarli 的并发保护是一个 **轻量级、基于单次 IO 锁的 Last-Write-Wins 方案**，核心要点：
 
-1. **读写保护**：使用 `FlockMutex` 文件锁包裹单次 `file_get_contents()` 和 `file_put_contents()`，保证不会读到半写入的损坏数据；但**不保护整个"读-改-写"周期**，锁获取失败时静默降级。
+### 8.1 读写保护与锁等待
+- 使用 `FlockMutex` 文件锁包裹单次 `file_get_contents()` 和 `file_put_contents()`，保证不会读到半写入的损坏数据
+- **锁参数 `2` 是超时时间（秒）**，不是 `LOCK_NB`：锁被占用时等待最多 2 秒，超时则抛出 `LockAcquireException`
+- **不保护整个"读-改-写"周期**：`read()` 和 `write()` 是两次独立的锁获取，中间修改内存时完全无锁
+- **静默降级策略**：锁获取失败时不报错、不打日志，直接无锁执行，可能导致数据损坏
 
-2. **版本检测**：每个书签有 `updated` 时间戳，每次 `set()` 自动刷新，但**仅用于展示和追踪**，不参与保存时的 CAS 校验。
+### 8.2 版本检测
+- 每个书签有 `updated` 时间戳，每次 `set()` 自动刷新，但**仅用于展示和追踪**
+- 不参与保存时的 CAS（Check-And-Set）校验，表单中无版本字段
 
-3. **冲突提示**：仅实现了"URL 重复"的 409 冲突检测；对同一书签、甚至不同书签的并发编辑**无任何提示**，后写入者用自己的整个内存快照覆盖先写入者。
+### 8.3 冲突提示
+- **仅实现了"URL 重复"的 409 冲突检测**，但检测基于内存快照，且检测与写入之间无锁保护（TOCTOU 竞态）
+- **同 URL 并发新增时，两个请求都会通过检测**，后写入的用相同 ID 覆盖先写入的所有数据
+- 对同一书签、甚至不同书签的并发编辑**无任何提示**，后写入者用自己的整个内存快照覆盖先写入者
 
-4. **落盘顺序**：`reorder()`（内存重排） → `write()`（持锁序列化整个快照写盘） → `invalidateCaches()`（缓存失效）。批量操作时采用"内存多改 + 一次落盘"优化，但并发风险不变。
+### 8.4 落盘顺序与写入原子性
+- 落盘顺序：`reorder()`（内存重排） → `write()`（持锁序列化整个快照写盘） → `invalidateCaches()`（缓存失效）
+- **写入无原子性保障**：
+  - `file_put_contents()` 返回值完全未检查，失败或半写入静默忽略
+  - 无"临时文件 + rename"的事务性写入模式，中途中断会导致文件损坏
+  - `checkDiskSpace()` 检查与实际写入之间存在 TOCTOU 竞态
+- 批量操作时采用"内存多改 + 一次落盘"优化，但并发风险不变
 
-5. **最严重的问题**：**即使编辑完全不同的书签，并发操作也会互相覆盖**，因为每次写入的是整个内存快照，而不是增量修改。
+### 8.5 最严重的问题
+1. **即使编辑完全不同的书签，并发操作也会互相覆盖**：每次写入的是整个内存快照，而不是增量修改
+2. **同 URL 并发新增会静默丢失数据**：`getNextId()` 基于旧快照分配相同 ID，后写入者完全覆盖先写入者
+3. **锁超时后静默降级**：高并发下自动放弃互斥保护，无任何告警
+
+---
+
+## 九、附录：锁等待与写盘边界的关键代码事实
+
+本附录集中列出三个边界问题的精确代码事实，每条均附行号与原始代码片段。
+
+### 9.1 边界一：2 秒超时无锁降级
+
+#### 事实 9.1.1 — 锁超时参数为 2 秒
+
+[ContainerBuilder.php#L95-L102](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/container/ContainerBuilder.php#L95-L102)：
+
+```php
+$container['bookmarkService'] = function (ShaarliContainer $container): BookmarkServiceInterface {
+    return new BookmarkFileService(
+        $container->conf,
+        $container->pluginManager,
+        $container->history,
+        new FlockMutex(fopen(SHAARLI_MUTEX_FILE, 'r'), 2),  // ← 第二参数 2 = 超时 2 秒
+        $container->loginManager->isLoggedIn()
+    );
+};
+```
+
+**关键事实**：
+- `FlockMutex` 构造函数第二参数是 `$timeout`（秒），**不是** `LOCK_NB` 标志位
+- 锁被占用时，malkusch/lock 会等待最多 2 秒（用 `ext-pcntl` 或忙等待重试）
+- 2 秒后仍获取不到锁 → 抛出 `LockAcquireException`
+
+#### 事实 9.1.2 — 异常捕获后静默降级为无锁执行
+
+[BookmarkIO.php#L152-L159](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkIO.php#L152-L159)：
+
+```php
+protected function synchronized(callable $function): void
+{
+    try {
+        $this->mutex->synchronized($function);
+    } catch (LockAcquireException $exception) {
+        $function();   // ← 捕获异常后，直接无锁执行原函数！
+    }
+}
+```
+
+**关键事实**：
+- 第 156 行捕获 `LockAcquireException`，第 157 行直接调用 `$function()`
+- 降级后**没有日志、没有告警、没有给用户的任何提示**
+- 注释（第 146 行）明确说明这是为兼容共享主机做的妥协：
+  > `If the lock can't be acquired (e.g. some shared hosting provider), we execute the function without mutex.`
+- 关联 issue：[https://github.com/shaarli/Shaarli/issues/1650](https://github.com/shaarli/Shaarli/issues/1650)（见第 148 行 `@see`）
+
+#### 事实 9.1.3 — 降级的影响范围
+
+降级同时影响 `read()` 和 `write()`，因为两者都通过 `synchronized()` 包装：
+
+- `read()` 的锁包装：[BookmarkIO.php#L86-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkIO.php#L86-L88)
+  ```php
+  $this->synchronized(function () use (&$content) {
+      $content = file_get_contents($this->datastore);
+  });
+  ```
+- `write()` 的锁包装：[BookmarkIO.php#L132-L141](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkIO.php#L132-L141)
+  ```php
+  $this->synchronized(function () use ($data) {
+      if (!$this->checkDiskSpace($data)) {
+          throw new NotEnoughSpaceException();
+      }
+      file_put_contents($this->datastore, $data);
+  });
+  ```
+
+**后果**：一旦降级，读和写都不再有互斥保护，多个请求可能同时 `file_put_contents()` 同一文件，导致内容交错损坏。
+
+---
+
+### 9.2 边界二：同 URL 并发新增时重复检测失效 + 相同 ID 覆盖
+
+#### 事实 9.2.1 — URL 重复检测在内存快照中进行，与写入之间无锁
+
+[Links.php#L125-L137](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/api/controllers/Links.php#L125-L137)（API `postLink`）：
+
+```php
+// duplicate by URL, return 409 Conflict
+if (
+    ! empty($bookmark->getUrl())
+    && ! empty($dup = $this->bookmarkService->findByUrl($bookmark->getUrl()))  // ← T1: 检查（内存快照）
+) {
+    return $response->withJson(
+        ApiUtils::formatLink($dup, index_url($this->ci['environment'])),
+        409,
+        $this->jsonStyle
+    );
+}
+
+$this->bookmarkService->add($bookmark);  // ← T2: 写入（中间无锁，且基于同一旧快照）
+```
+
+**关键事实**：
+- 第 128 行 `findByUrl()` 查询的是**当前请求的内存快照**，不是磁盘实时状态
+- 第 128 行（检查）与第 137 行（写入）之间**没有任何锁保护**
+- 两个并发请求都读到"无此 URL"的旧快照 → 都通过检查 → 都执行 `add()`
+
+#### 事实 9.2.2 — `findByUrl` 只查内存数组
+
+[BookmarkFileService.php#L129-L132](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkFileService.php#L129-L132)：
+
+```php
+public function findByUrl(string $url): ?Bookmark
+{
+    return $this->bookmarks->getByUrl($url);  // ← 只查内存 $this->bookmarks
+}
+```
+
+`getByUrl` 实现 [BookmarkArray.php#L224-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkArray.php#L224-L234)：
+
+```php
+public function getByUrl(string $url): ?Bookmark
+{
+    if (
+        ! empty($url)
+        && isset($this->urls[$url])
+        && isset($this->bookmarks[$this->urls[$url]])
+    ) {
+        return $this->bookmarks[$this->urls[$url]];
+    }
+    return null;
+}
+```
+
+**关键事实**：第 228 行 `isset($this->urls[$url])` 只查内存中的 `urls[]` 映射，不访问磁盘。
+
+#### 事实 9.2.3 — `getNextId` 基于内存快照，并发时分配相同 ID
+
+[BookmarkArray.php#L211-L217](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkArray.php#L211-L217)：
+
+```php
+public function getNextId(): int
+{
+    if (!empty($this->ids)) {
+        return max(array_keys($this->ids)) + 1;  // ← 基于内存 ids[] 计算
+    }
+    return 0;
+}
+```
+
+**关键事实**：
+- 第 214 行 `max(array_keys($this->ids)) + 1` 基于当前内存快照的最大 ID
+- 两个并发请求的快照相同 → `getNextId()` 返回**相同的值**
+- 例如快照中最大 ID 为 5，两个请求都会拿到 `nextId = 6`
+
+#### 事实 9.2.4 — `add` 不做二次 URL 检查，直接用分配的 ID 写入
+
+[BookmarkFileService.php#L222-L239](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkFileService.php#L222-L239)：
+
+```php
+public function add(Bookmark $bookmark, bool $save = true): Bookmark
+{
+    if (true !== $this->isLoggedIn) {
+        throw new Exception(t('You\'re not authorized to alter the datastore'));
+    }
+    if (!empty($bookmark->getId())) {
+        throw new Exception(t('This bookmarks already exists'));
+    }
+    $bookmark->setId($this->bookmarks->getNextId());  // ← 第 230 行：分配 ID（可能与另一请求相同）
+    $bookmark->validate();
+
+    $this->bookmarks[$bookmark->getId()] = $bookmark;  // ← 第 233 行：写入内存快照
+    if ($save === true) {
+        $this->save();  // ← 第 235 行：整个快照落盘，覆盖磁盘
+        $this->history->addLink($bookmark);
+    }
+    return $this->bookmarks[$bookmark->getId()];
+}
+```
+
+**关键事实**：
+- 第 230 行 `setId()` 用内存快照计算的 ID，并发时会重复
+- 第 233 行 `$this->bookmarks[$bookmark->getId()]` 用相同 ID 覆盖内存中的条目
+- 第 235 行 `save()` → `write()` 用整个内存快照覆盖磁盘
+- **`add()` 内部没有重新检查 URL 是否已存在**，完全信任控制器层的检查结果
+
+#### 事实 9.2.5 — 并发新增的完整时序
+
+```
+磁盘初始：{#5: url="old.com"}，最大 ID = 5
+
+T0: 请求 A 构造 → read() → 快照_A = {#5:"old.com"}，nextId 计算 = 6
+T1: 请求 B 构造 → read() → 快照_B = {#5:"old.com"}，nextId 计算 = 6（相同！）
+
+T2: 请求 A 执行 findByUrl("new.com") → 快照_A 无 → 通过
+T3: 请求 B 执行 findByUrl("new.com") → 快照_B 无 → 通过
+
+T4: 请求 A 执行 add()：
+    → setId(6)（第 230 行）
+    → bookmarks[6] = bookmark_A（第 233 行）
+    → save() → write() [锁] → 磁盘 = {#5:"old.com", #6:"bookmark_A"}
+
+T5: 请求 B 执行 add()：
+    → setId(6)（第 230 行，和 A 相同！）
+    → bookmarks[6] = bookmark_B（第 233 行，覆盖内存中的 A）
+    → save() → write() [锁] → 磁盘 = {#5:"old.com", #6:"bookmark_B"}  ← A 的数据丢失！
+
+最终：只有一个 #6，内容是 B 的，A 完全丢失，无 409 提示
+```
+
+---
+
+### 9.3 边界三：普通文件写入失败或半写入风险
+
+#### 事实 9.3.1 — `file_put_contents` 返回值完全未检查
+
+[BookmarkIO.php#L132-L141](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkIO.php#L132-L141)：
+
+```php
+$this->synchronized(function () use ($data) {
+    if (!$this->checkDiskSpace($data)) {
+        throw new NotEnoughSpaceException();
+    }
+
+    file_put_contents(       // ← 第 137 行
+        $this->datastore,    // ← 第 138 行
+        $data                 // ← 第 139 行
+    );                       // ← 第 140 行：返回值被完全丢弃！
+});
+```
+
+**关键事实**：
+- 第 137-140 行 `file_put_contents()` 的返回值没有被任何变量接收，也没有 `if` 判断
+- `file_put_contents()` 的返回值语义：
+  - 成功：返回写入字节数（`int`）
+  - 失败：返回 `false`
+  - 部分写入：返回实际写入字节数（可能小于 `strlen($data)`）
+- 由于不检查返回值，以下情况全部**静默通过**：
+  - 磁盘满 → 写入失败，datastore 保持旧内容，用户以为保存成功
+  - 文件权限被改 → 写入失败，同上
+  - 磁盘 IO 错误 → 写入失败或部分写入，同上
+  - 部分写入 → datastore 文件损坏
+
+#### 事实 9.3.2 — 无临时文件 + rename 的原子写入
+
+整个 `write()` 方法 [BookmarkIO.php#L114-L142](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkIO.php#L114-L142) 中，写入方式为：
+
+```php
+$data = base64_encode(gzdeflate(serialize($links)));     // 第 124 行：序列化
+// ... 前缀后缀拼接 ...
+$this->synchronized(function () use ($data) {
+    if (!$this->checkDiskSpace($data)) {
+        throw new NotEnoughSpaceException();
+    }
+    file_put_contents($this->datastore, $data);          // 第 137-140 行：直接覆盖原文件
+});
+```
+
+**关键事实**：
+- 第 137 行直接对 `$this->datastore`（原文件）执行 `file_put_contents`
+- **没有**先写入临时文件（如 `datastore.php.tmp`）
+- **没有**用 `rename()` 做原子替换
+- `file_put_contents` 内部实现是 `open → truncate → write → close`，**truncate 之后、write 完成之前**，原文件内容已被清空
+
+**半写入损坏场景**：
+```
+file_put_contents 执行过程：
+  1. open(datastore.php, 'w')      → 打开文件
+  2. truncate(datastore.php, 0)    → 清空原文件（此时原数据已丢失！）
+  3. write(datastore.php, $data)   → 开始写入新数据
+     ↓ 如果此时发生：
+     ├─ PHP 进程被 kill（如 max_execution_time）
+     ├─ 服务器断电
+     ├─ 磁盘故障
+     └─ 内存不足 OOM
+     → 文件停留在"部分写入"状态
+  4. close(datastore.php)          → 关闭文件
+```
+
+如果第 3 步中断，下次 `read()` 时 [BookmarkIO.php#L92-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkIO.php#L92-L94) 会失败：
+
+```php
+$links = unserialize(gzinflate(base64_decode(
+    substr($content, strlen(self::$phpPrefix), -strlen(self::$phpSuffix))
+)));
+```
+
+`gzinflate()` 或 `unserialize()` 会抛出异常，导致整个应用无法加载书签数据。
+
+#### 事实 9.3.3 — `checkDiskSpace` 的 TOCTOU 竞态与降级放行
+
+[BookmarkIO.php#L169-L176](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkIO.php#L169-L176)：
+
+```php
+public function checkDiskSpace(string $data): bool
+{
+    if (function_exists('disk_free_space') === false) {
+        return true;   // ← 第 172 行：无法检测时直接放行！
+    }
+    return disk_free_space(dirname($this->datastore)) > (strlen($data) + 1024 * 500);
+}
+```
+
+**关键事实**：
+- 第 171 行：如果 `disk_free_space` 函数不存在（某些受限环境），直接 `return true` 放行
+- 第 175 行：检查通过后，到第 137 行 `file_put_contents` 执行之间，磁盘空间可能被其他进程消耗
+- 这是一个经典的 TOCTOU（Time-of-Check to Time-of-Use）问题
+- 即使检查在锁内，锁也无法阻止**操作系统其他进程**消耗磁盘空间
+
+**场景**：
+```
+T0: checkDiskSpace() → 剩余 10MB > 所需 1MB + 500KB → 通过
+T1: 其他系统进程写入 10MB 日志 → 磁盘满
+T2: file_put_contents() → 磁盘满，写入失败
+T3: 返回值未检查 → 静默"成功"
+```
+
+#### 事实 9.3.4 — 降级为无锁时多进程同时写入的交错损坏
+
+当 [BookmarkIO.php#L156-L157](file:///d:/fz/0601-2/solo-dogfeeding/code/37-Shaarli/application/bookmark/BookmarkIO.php#L156-L157) 降级为无锁执行时：
+
+```php
+} catch (LockAcquireException $exception) {
+    $function();   // ← 无锁执行 file_put_contents
+}
+```
+
+两个请求同时执行 `file_put_contents($this->datastore, $data)`：
+
+```
+请求 A: open → truncate → write("AAAA...") → close
+请求 B: open → truncate → write("BBBB...") → close
+
+由于没有互斥锁，两个 write 可能交错：
+  文件内容 = "AAAABBBBAAAABBBB..."（交错损坏）
+  或 = "BBBB..."（B 完全覆盖，A 丢失）
+  或 = "AAAA..."（A 完全覆盖，B 丢失）
+
+无论哪种结果，unserialize/gzinflate 都无法解析
+```
+
+**关键事实**：`file_put_contents` 本身不保证原子性，PHP 文档明确说明它是 `fopen + fwrite + fclose` 的组合，多进程并发写同一文件会产生交错。
