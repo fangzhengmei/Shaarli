@@ -296,7 +296,7 @@ ShaarePublishController::save()
   │           │     ├─ 序列化编码（无锁）              // serialize → gzdeflate → base64
   │           │     └─ synchronized() {               // [锁获取]
   │           │           ├─ checkDiskSpace()
-  │           │           └─ file_put_contents()      // 原子写入整个快照
+  │           │           └─ file_put_contents()      // 写入整个快照（非原子）
   │           │        }                              // [锁释放]
   │           └─ pageCacheManager->invalidateCaches() // Step 3: 清缓存
   └─ 8. history->updateLink($bookmark)                // 写入操作历史
