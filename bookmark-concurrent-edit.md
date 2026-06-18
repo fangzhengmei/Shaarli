@@ -47,7 +47,7 @@ $container['bookmarkService'] = function (ShaarliContainer $container): Bookmark
         $container->conf,
         $container->pluginManager,
         $container->history,
-        new FlockMutex(fopen(SHAARLI_MUTEX_FILE, 'r'), 2),  // 第二个参数 2 = LOCK_NB 非阻塞模式
+        new FlockMutex(fopen(SHAARLI_MUTEX_FILE, 'r'), 2),  // 第二个参数 2 = 超时时间 2 秒
         $container->loginManager->isLoggedIn()
     );
 };
